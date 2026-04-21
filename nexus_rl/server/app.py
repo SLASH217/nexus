@@ -28,6 +28,18 @@ Usage:
     python -m server.app
 """
 
+import os
+from pathlib import Path
+
+# Load .env file if it exists
+env_file = Path(__file__).parent.parent / ".env"
+if env_file.exists():
+    from dotenv import load_dotenv
+    load_dotenv(env_file)
+
+# Enable web interface if not already set
+os.environ.setdefault("ENABLE_WEB_INTERFACE", "true")
+
 try:
     from openenv.core.env_server.http_server import create_app
 except Exception as e:  # pragma: no cover
@@ -84,11 +96,5 @@ def main() -> None:
 
     uvicorn.run(app, host=args.host, port=args.port)
 
-
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-    main(port=args.port)
+    main()
