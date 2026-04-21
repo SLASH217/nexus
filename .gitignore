@@ -5,6 +5,79 @@ build/
 dist/
 wheels/
 *.egg-info
+*.egg
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
 
 # Virtual environments
 .venv
+venv/
+ENV/
+env/
+.env.venv
+
+# Environment variables (SENSITIVE)
+.env
+.env.local
+.env.*.local
+.env.production.local
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+.settings/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+Desktop.ini
+.Spotlight-V100
+.Trashes
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Docker
+docker-compose.override.yml
+
+# Local logs and temp files
+*.log
+*.pot
+.tmp/
+tmp/
+
+# Node (if used)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Pyre
+.pyre/
+
+# UV/uv lock (if you want to lock dependencies)
+# uv.lock
+
