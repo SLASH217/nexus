@@ -29,17 +29,24 @@ class NexusRlEnv(
         >>> # Connect to a running server
         >>> with NexusRlEnv(base_url="http://localhost:8000") as client:
         ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
+        ...     print(result.observation.inventory)
         ...
-        ...     result = client.step(NexusRlAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
+        ...     action = NexusRlAction(
+        ...         action_type="PROPOSE",
+        ...         target_id=1,
+        ...         offer_E=20,
+        ...         request_C=10
+        ...     )
+        ...     result = client.step(action)
+        ...     print(result.observation.utility)
 
     Example with Docker:
         >>> # Automatically start container and connect
         >>> client = NexusRlEnv.from_docker_image("nexus_rl-env:latest")
         >>> try:
         ...     result = client.reset()
-        ...     result = client.step(NexusRlAction(message="Test"))
+        ...     action = NexusRlAction(action_type="WAIT")
+        ...     result = client.step(action)
         ... finally:
         ...     client.close()
     """
@@ -48,6 +55,8 @@ class NexusRlEnv(
         """
         Convert NexusRlAction to JSON payload for step message.
 
+        Maps the rich action structure to the JSON payload the server expects.
+
         Args:
             action: NexusRlAction instance
 
@@ -55,12 +64,19 @@ class NexusRlEnv(
             Dictionary representation suitable for JSON encoding
         """
         return {
+            "action_type": action.action_type,
+            "target_id": action.target_id,
+            "offer_E": action.offer_E,
+            "request_C": action.request_C,
             "message": action.message,
         }
 
     def _parse_result(self, payload: Dict) -> StepResult[NexusRlObservation]:
         """
         Parse server response into StepResult[NexusRlObservation].
+
+        Converts the server's raw JSON response back into our rich Pydantic Observation,
+        properly unwrapping the OpenEnv envelope format.
 
         Args:
             payload: JSON response data from server
@@ -69,17 +85,23 @@ class NexusRlEnv(
             StepResult with NexusRlObservation
         """
         obs_data = payload.get("observation", {})
+
+        # Build the observation Agent 0 will actually see
         observation = NexusRlObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
+            agent_id=obs_data.get("agent_id", 0),
+            inventory=obs_data.get("inventory", {"E": 0, "C": 0}),
+            public_ledger=obs_data.get("public_ledger", []),
+            social_lattice=obs_data.get("social_lattice", {}),
+            environment_status=obs_data.get("environment_status", "NORMAL"),
+            utility=obs_data.get("utility", 0.0),
             done=payload.get("done", False),
-            reward=payload.get("reward"),
+            reward=payload.get("reward", 0.0),
             metadata=obs_data.get("metadata", {}),
         )
 
         return StepResult(
             observation=observation,
-            reward=payload.get("reward"),
+            reward=payload.get("reward", 0.0),
             done=payload.get("done", False),
         )
 
