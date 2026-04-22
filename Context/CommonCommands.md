@@ -1,5 +1,7 @@
 # **Common Commands & Quick Reference**
 
+> 📖 **For comprehensive technical documentation**, see [`docs/IMPLEMENTATION_GUIDE.md`](../docs/IMPLEMENTATION_GUIDE.md) for detailed architecture, design decisions, and the complete roadmap.
+
 ## **Project Setup**
 
 ### Initialize Environment
