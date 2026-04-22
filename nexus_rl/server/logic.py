@@ -75,17 +75,24 @@ def update_trust(
 
 def calculate_shock() -> str:
     """
-    Environmental shock generator.
+    Environmental shock generator (stochastic).
     
-    Returns one of:
-    - "NORMAL": Standard trading conditions
-    - "SOLAR_FLARE": All agents lose 20% of Energy (forced renegotiation)
-    - "GRID_FAILURE": All agents lose 20% of Compute
+    Probability per step:
+    - 85% chance: "NORMAL" (standard trading)
+    - 10% chance: "SOLAR_FLARE" (all agents lose 20% Energy)
+    - 5% chance: "GRID_FAILURE" (all agents lose 20% Compute)
     
-    For now, always returns "NORMAL" (deterministic).
-    Later: Implement stochastic shock logic (~5% probability each).
+    These shocks force agents to renegotiate and test cooperation under pressure.
     
     Returns:
-        str: Current shock status
+        str: Shock status - one of "NORMAL", "SOLAR_FLARE", "GRID_FAILURE"
     """
-    return "NORMAL"
+    import random
+    
+    rand = random.random()
+    if rand < 0.05:
+        return "SOLAR_FLARE"
+    elif rand < 0.15:
+        return "GRID_FAILURE"
+    else:
+        return "NORMAL"
