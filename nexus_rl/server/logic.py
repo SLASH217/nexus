@@ -25,6 +25,8 @@ def calculate_utility(energy: int, compute: int) -> float:
         U = min(E, C)
     
     Intuition:
+    TOUCH: what happens if a agent dies is it out of the race completely?
+    what if it reaches 0 0 somehow?
     - If you have 100 Energy but 0 Compute, you're still dead (utility = 0).
     - Hoarding one resource is a losing strategy.
     - This incentivizes **interdependence**.
@@ -38,7 +40,13 @@ def calculate_utility(energy: int, compute: int) -> float:
     """
     return float(min(energy, compute))
 
+# something like impact = alpha * trade_value / max_resource_count to fix the linear update of the trust function this prevents big betrayals and some good behavior from cancelling out.
+# return impact * target + (1 - impact) * current_score
 
+# In long runs where agent learns to be nice everyone's trust score ewill eventually hit 1 at this point the social lattice loses all information density an agent can't distinguish between a long term reliable partner and a former bully who just started behaving recently.
+# this means the trust variable kind of becomes useless in the later portion of the episodes.
+# One proposed solution for this is :
+# the trust should naturally drift towards a neutral of 0.5 over time if there are no interactions, this way an agent that was once a bully but has been behaving for a while will have a trust score that reflects that history, and a long term reliable partner will also have a score that reflects their history. This also means that an agent that was once reliable but has recently started behaving badly will have a score that reflects that change in behavior. This way the trust variable retains its information density throughout the episode.
 def update_trust(
     current_score: float,
     fulfilled: bool,
@@ -68,11 +76,14 @@ def update_trust(
     Returns:
         float: Updated trust score [0.0, 1.0]
     """
+    # is this the correct formula?
     target = 1.0 if fulfilled else 0.0
     new_score = (alpha * target) + (1.0 - alpha) * current_score
     return max(0.0, min(1.0, new_score))  # Clamp to [0.0, 1.0]
 
 
+# update suggestion 
+# Shocks should be resource specific and asymmetric. suppose a solar flare should not just hit everyone it should hit the "engery produceer" harder forcing them to  become a beggar and reversing the power dynamic
 def calculate_shock() -> str:
     """
     Environmental shock generator (stochastic).

@@ -29,6 +29,7 @@ def format_trust_bar(score: float, width: int = 20) -> str:
     Returns:
         str: ASCII bar like "▓▓▓▓░░░░░░░░░░░░░░░░ (0.20)"
     """
+    # is returning such ascii bars a viable strategy??
     filled = int(score * width)
     empty = width - filled
     bar = "▓" * filled + "░" * empty
@@ -229,6 +230,7 @@ def format_observation_for_llm(
     return "\n".join(lines)
 
 
+# is this function fully implemented?
 def format_action_error(error_msg: str, action_type: str) -> str:
     """
     Format an action validation error for the LLM to learn from.

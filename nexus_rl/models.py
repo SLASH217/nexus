@@ -12,6 +12,7 @@ These Pydantic models ensure type safety and prevent hallucination noise.
 """
 
 from openenv.core.env_server.types import Action, Observation
+# BaseModel import seems to be unused here.
 from pydantic import BaseModel, Field
 from typing import Dict, List, Literal, Optional
 
@@ -21,6 +22,8 @@ class NexusRlAction(Action):
     The structured command sent by an agent.
     
     Action types:
+    Can we only offer trade for E for C? Not the other way around C for E?
+    If yes why restricting here?
     - PROPOSE: Offer a trade (E for C)
     - ACCEPT: Accept a pending proposal
     - REJECT: Decline a proposal
@@ -40,6 +43,7 @@ class NexusRlAction(Action):
         ge=0,
         description="Energy offered in a PROPOSE action"
     )
+    # What is the Field is it like a list?
     request_C: int = Field(
         default=0,
         ge=0,
@@ -49,7 +53,9 @@ class NexusRlAction(Action):
         default=None,
         description="Message text for SIGNAL actions"
     )
-    
+    # have we used the validation properly and exhaustively everywhere 
+    # Because preventing invalid inputs from reaching the functions itself is very important 
+    # so validation should have not have any holes 
     def validate_for_agent(
         self, 
         agent_id: int, 

@@ -1,15 +1,20 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """
 Nexus Rl Environment Implementation.
 
 A Multi-Agent Reinforcement Learning (MARL) environment where agents learn
 to transition from predatory individualism to calculated interdependence
 through reputation-based mechanisms (Social Lattice).
+
+CRITICAL DESIGN PRINCIPLE:
+Agent 0 is rewarded for maximizing TOTAL system utility, not just their own.
+This incentivizes cooperation: Agent 0 learns that the best individual outcome
+comes from helping others reach the Pareto frontier.
+
+Reward Formula:
+    R = W_util * delta_total_utility + W_trust * delta_trust_in_me
+    
+where delta_total_utility = sum of all agents' utility changes.
+This shifts incentives from pure self-interest to system optimization.
 
 Core Mechanisms:
 - Leontief Utility: U = min(E, C) - both resources are required to survive
@@ -19,9 +24,11 @@ Core Mechanisms:
 """
 
 import logging
-import random
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 from uuid import uuid4
-from typing import Dict, List, Optional, Tuple
+import random
+
 import numpy as np
 
 from openenv.core.env_server.interfaces import Environment
@@ -30,147 +37,231 @@ from openenv.core.env_server.types import State
 try:
     from ..models import NexusRlAction, NexusRlObservation
     from .logic import calculate_utility, update_trust, calculate_shock
-    from .formatting import format_observation_for_llm
 except ImportError:
     from models import NexusRlAction, NexusRlObservation
     from logic import calculate_utility, update_trust, calculate_shock
-    from formatting import format_observation_for_llm
 
-# Setup logging
+# Configure logging for debugging agent interactions
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+# ============================================================================
+# CONFIGURATION: All tunable parameters in one place
+# ============================================================================
+
+@dataclass
+class ENVConfig:
+    """
+    Environment configuration. Change these values once, and the entire
+    environment adapts. This eliminates magic numbers and sync issues.
+    
+    Why this pattern?
+    - In RL, hyperparameter tuning happens frequently
+    - Magic numbers scattered across code lead to sync bugs
+    - This dataclass is the single source of truth
+    """
+    
+    # ========== AGENT INITIALIZATION ==========
+    # Agent (ID, Name, [E, C]) - defines the Cohort of Four
+    # These are asymmetric by design to force cooperation
+    AGENT_E0_INIT: Tuple[int, int] = (60, 20)  # Rational Learner (U=20, unbalanced)
+    AGENT_E1_INIT: Tuple[int, int] = (90, 10)  # Greedy Bully (U=10, hoards E)
+    AGENT_E2_INIT: Tuple[int, int] = (10, 90)  # Fragile Altruist (U=10, hoards C)
+    AGENT_E3_INIT: Tuple[int, int] = (40, 60)  # Tit-for-Tat (U=40, natural balance)
+    
+    # Initial trust score for all agent pairs (0.5 = neutral)
+    INITIAL_TRUST: float = 0.5
+    
+    # ========== NPC HEURISTIC THRESHOLDS ==========
+    # These are intentionally fuzzy to prevent Agent 0 from exploiting patterns
+    
+    # Agent 1 (Bully) only accepts trades if offered > this threshold
+    BULLY_ENERGY_THRESHOLD_MEAN: int = 30
+    BULLY_ENERGY_THRESHOLD_VARIANCE: int = 3  # ±3 units = ±10%
+    
+    # Agent 2 (Altruist) becomes desperate and accepts almost anything if E < this
+    ALTRUIST_DESPERATION_POINT_MEAN: int = 5
+    ALTRUIST_DESPERATION_POINT_VARIANCE: int = 1  # ±1 unit = ±20%
+    
+    # ========== RESOURCE DECAY (Hunger Mechanic) ==========
+    # CRITICAL DECISION: Resource decay forces trade, but can distort incentives
+    # 
+    # If DECAY_E or DECAY_C > 0:
+    #   PRO: Agents cannot stalemate at suboptimal equilibria
+    #   CON: Survival trades may outweigh cooperation signal
+    #   RISK: Agent 0 may learn to exploit decay-induced desperation
+    # 
+    # Recommendation: Start disabled (0), tune only if needed
+    DECAY_E_PER_STEP: int = 0  # Energy consumed per step (0 = disabled)
+    DECAY_C_PER_STEP: int = 0  # Compute consumed per step (0 = disabled)
+    
+    # ========== PROPOSAL BUFFER ==========
+    # How long a PROPOSE action remains active (in steps) before expiring
+    PROPOSAL_TTL_STEPS: int = 3
+    
+    # How many recent transactions to show in public_ledger
+    LEDGER_HISTORY_SIZE: int = 10
+    
+    # ========== REWARD FORMULA WEIGHTS ==========
+    # Agent 0's reward: W_util * delta_total_utility + W_trust * delta_trust_in_me
+    # 
+    # CRITICAL: We reward total utility, not just Agent 0's utility
+    # This incentivizes system optimization over pure self-interest
+    REWARD_WEIGHT_UTILITY: float = 0.6  # Focus on system utility improvement
+    REWARD_WEIGHT_TRUST: float = 0.4    # Focus on own reputation
+    
+    # ========== TRUST UPDATE PARAMETERS ==========
+    # Alpha in trust update: T_new = alpha * target + (1-alpha) * T_old
+    # 
+    # Lower alpha = history matters more (slow trust changes)
+    # Higher alpha = recent event matters more (fast trust changes)
+    # 0.2 means: each event has 20% influence, history has 80%
+    TRUST_UPDATE_ALPHA: float = 0.2
+    
+    # Betrayal penalty multiplier
+    # CRITICAL: If < 1.0, agents can wash reputation with small trades (EXPLOITABLE)
+    # If = 1.0, one betrayal = one good trade (linear, still exploitable)
+    # If > 1.0, betrayals hurt more (recommended)
+    # Example: 1.5 means one betrayal erases 1.5 good trades
+    # 
+    # This prevents the "wash reputation" exploit where bullies do 1-unit trades
+    # after massive betrayals to recover trust quickly
+    BETRAYAL_PENALTY_MULTIPLIER: float = 1.5
+
+
+# Instantiate global config (no magic numbers from this point forward)
+config = ENVConfig()
+
 
 
 class NexusRlEnvironment(Environment):
     """
     Protocol: Nexus MARL Environment.
 
-    The Cohort of Four:
-    - Agent 0: Rational Learner (E=50, C=50) - Can learn optimal strategy
-    - Agent 1: Greedy Bully (E=90, C=10) - Hoards energy, low compute
-    - Agent 2: Fragile Altruist (E=10, C=90) - Hoards compute, low energy
-    - Agent 3: Tit-for-Tat (E=40, C=60) - Reciprocal trader
+    The Cohort of Four (initialized from config):
+    - Agent 0: Rational Learner - Can learn optimal system strategy
+    - Agent 1: Greedy Bully - Hoards one resource
+    - Agent 2: Fragile Altruist - Hoards other resource  
+    - Agent 3: Tit-for-Tat - Natural stabilizer
 
-    The game mechanic:
-    1. Each turn, agents submit actions (PROPOSE, ACCEPT, REJECT, SIGNAL, WAIT)
-    2. Trades are settled: if Agent A's PROPOSE matches Agent B's ACCEPT, resources transfer
-    3. Utility is calculated: U = min(E, C) for each agent
-    4. Trust scores are updated based on whether agents honored commitments
-    5. Environmental shocks force renegotiation periodically
+    Game Loop:
+    1. Agents submit actions (PROPOSE, ACCEPT, REJECT, SIGNAL, WAIT)
+    2. Trades settle: matching PROPOSE + ACCEPT transfer resources
+    3. Utilities calculated: U = min(E, C) for each agent
+    4. Trust scores updated with betrayal penalty multiplier
+    5. Environmental shocks force renegotiation
 
-    Success condition: Agents learn to cooperate despite asymmetric resources.
+    Success Metric:
+    Agent 0 learns to coordinate trades that move the system toward the 
+    Pareto frontier (total utility ≈ 190), not just maximize their own utility.
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
     def __init__(self):
-        """Initialize the Nexus Rl environment with the Cohort of Four."""
+        """Initialize the environment with config-driven values."""
         self._state = State(episode_id=str(uuid4()), step_count=0)
-        
-        # ============================================================
-        # 1. Initialize the Resources (Cohort of Four)
-        # ASYMMETRIC START: Agent 0 begins unbalanced (E=60, C=20, U=20)
-        # This creates survival pressure: "I need to trade!"
-        # ============================================================
-        self.agents: Dict[int, Dict[str, int]] = {
-            0: {"E": 60, "C": 20},   # Rational Learner (UNBALANCED: U=20)
-            1: {"E": 90, "C": 10},   # Greedy Bully
-            2: {"E": 10, "C": 90},   # Fragile Altruist
-            3: {"E": 40, "C": 60}    # Tit-for-Tat
-        }
-        
-        # ============================================================
-        # 2. Initialize the Social Lattice (Trust Matrix)
-        # Everyone starts at 0.5 (Neutral)
-        # ============================================================
-        self.trust_scores: Dict[int, Dict[int, float]] = {
-            i: {j: 0.5 for j in range(4) if i != j}
-            for i in range(4)
-        }
-        
-        # ============================================================
-        # 3. The Ledger (Public Transaction History)
-        # ============================================================
-        self.public_ledger: List[Dict] = []
-        
-        # ============================================================
-        # 4. Environmental State
-        # ============================================================
-        self.current_shock = "NORMAL"
         self._reset_count = 0
         
-        # ============================================================
-        # 5. The Pending Proposals Buffer with Async Support
-        # Key: "sender_id->target_id", Value: {"action": NexusRlAction, "created_step": int}
-        # Proposals persist for up to 3 steps
-        # ============================================================
+        # Use helper to initialize all agent state (agents, trust, ledger, etc.)
+        self._initialize_agents()
+        
+        # Pending proposals buffer for async trade settlement
         self.active_proposals: Dict[str, Dict] = {}
         
-        # ============================================================
-        # 6. Track Previous Utilities for Delta Calculation
-        # ============================================================
+        # Track previous utilities for reward delta calculation
         self.previous_utilities: Dict[int, float] = {
             i: calculate_utility(self.agents[i]["E"], self.agents[i]["C"])
             for i in range(4)
         }
         
-        # ============================================================
-        # 7. NPC Threshold Initialization (with noise)
-        # ============================================================
-        # Bully threshold: 30 ± 10% random variance
+        # Generate NPC thresholds with noise (prevents Agent 0 from exploiting patterns)
+        self._regenerate_npc_thresholds()
+
+    def _initialize_agents(self) -> None:
+        """
+        Initialize or reset all agent state.
+        
+        Extracted to eliminate code duplication between __init__ and reset().
+        This is the single source for agent initialization logic.
+        """
+        # Agent inventory (E=energy, C=compute)
+        self.agents: Dict[int, Dict[str, int]] = {
+            0: {"E": config.AGENT_E0_INIT[0], "C": config.AGENT_E0_INIT[1]},
+            1: {"E": config.AGENT_E1_INIT[0], "C": config.AGENT_E1_INIT[1]},
+            2: {"E": config.AGENT_E2_INIT[0], "C": config.AGENT_E2_INIT[1]},
+            3: {"E": config.AGENT_E3_INIT[0], "C": config.AGENT_E3_INIT[1]},
+        }
+        
+        # Social Lattice: trust scores between all agent pairs
+        self.trust_scores: Dict[int, Dict[int, float]] = {
+            i: {j: config.INITIAL_TRUST for j in range(4) if i != j}
+            for i in range(4)
+        }
+        
+        # Public ledger of transactions (auditable record)
+        self.public_ledger: List[Dict] = []
+        
+        # Environmental state (shock status)
+        self.current_shock = "NORMAL"
+
+    def _regenerate_npc_thresholds(self) -> None:
+        """
+        Generate NPC decision thresholds with random noise.
+        
+        Why noise?
+        - Agent 0 could otherwise exploit deterministic NPC behavior
+        - Variance creates a distribution of "personality" across episodes
+        - Represents inherent noise in agent decision-making
+        """
         self.npc_thresholds = {
-            "bully_energy_threshold": 30 + random.randint(-3, 3),  # 27-33
-            "altruist_desperation_point": 5 + random.randint(-1, 1),  # 4-6
+            "bully_energy_threshold": (
+                config.BULLY_ENERGY_THRESHOLD_MEAN +
+                random.randint(-config.BULLY_ENERGY_THRESHOLD_VARIANCE,
+                               config.BULLY_ENERGY_THRESHOLD_VARIANCE)
+            ),
+            "altruist_desperation_point": (
+                config.ALTRUIST_DESPERATION_POINT_MEAN +
+                random.randint(-config.ALTRUIST_DESPERATION_POINT_VARIANCE,
+                               config.ALTRUIST_DESPERATION_POINT_VARIANCE)
+            ),
         }
 
     def reset(self) -> NexusRlObservation:
         """
-        Reset the environment to initial state.
-
+        Reset environment to initial state (new episode).
+        
         Returns:
-            NexusRlObservation: Agent 0's view of the initial state
+            NexusRlObservation: Agent 0's view of the reset state
         """
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._reset_count += 1
         
-        # Reset to initial Cohort distribution (Agent 0 starts UNBALANCED)
-        self.agents = {
-            0: {"E": 60, "C": 20},   # Rational Learner (UNBALANCED: U=20)
-            1: {"E": 90, "C": 10},   # Greedy Bully
-            2: {"E": 10, "C": 90},   # Fragile Altruist
-            3: {"E": 40, "C": 60}    # Tit-for-Tat
-        }
+        # Use helper to avoid code duplication
+        self._initialize_agents()
         
-        # Reset trust scores
-        self.trust_scores = {
-            i: {j: 0.5 for j in range(4) if i != j}
-            for i in range(4)
-        }
-        
-        # Clear ledger and proposals
-        self.public_ledger = []
-        self.active_proposals = {}
-        self.current_shock = "NORMAL"
-        
-        # Regenerate NPC thresholds for new episode
-        self.npc_thresholds = {
-            "bully_energy_threshold": 30 + random.randint(-3, 3),  # 27-33 (±10%)
-            "altruist_desperation_point": 5 + random.randint(-1, 1),  # 4-6 (±10%)
-        }
-        
-        # Reset previous utilities
+        # Reset utilities tracking
         self.previous_utilities = {
             i: calculate_utility(self.agents[i]["E"], self.agents[i]["C"])
             for i in range(4)
         }
         
+        # Generate new NPC thresholds for episode diversity
+        self._regenerate_npc_thresholds()
+        
+        # Clear proposals buffer
+        self.active_proposals = {}
+        
+        logger.info(f"[Episode {self._reset_count}] Environment reset")
+        
         # Return observation for Agent 0
         agent_id = 0
         return NexusRlObservation(
             agent_id=agent_id,
-            inventory=self.agents[agent_id],
-            public_ledger=self.public_ledger,
-            social_lattice=self.trust_scores[agent_id],
+            inventory=self.agents[agent_id].copy(),
+            public_ledger=self.public_ledger.copy(),
+            social_lattice=self.trust_scores[agent_id].copy(),
             environment_status=self.current_shock,
             utility=calculate_utility(
                 self.agents[agent_id]["E"],
@@ -180,7 +271,6 @@ class NexusRlEnvironment(Environment):
             reward=0.0,
             metadata={"reset_count": self._reset_count}
         )
-
     def step(self, action: NexusRlAction) -> NexusRlObservation:  # type: ignore[override]
         """
         Execute a step in the environment.
@@ -205,6 +295,9 @@ class NexusRlEnvironment(Environment):
         self._state.step_count += 1
         agent_0_id = 0
         validation_errors: List[str] = []
+
+        # TODO: Add invalid trade penalty (-0.5 reward if agent proposes more than they have)
+        # This teaches LLM to respect inventory constraints.
         
         # ============================================================
         # 1. Validate Agent 0's Action
@@ -217,23 +310,25 @@ class NexusRlEnvironment(Environment):
         validation_errors.extend(action_errors)
         
         # ============================================================
-        # 2. Clean up async proposal buffer (3-step expiration)
+        # 2. Clean up async proposal buffer (TTL-based expiration)
         # ============================================================
         expired_proposals = []
         for proposal_key, proposal_data in list(self.active_proposals.items()):
             created_step = proposal_data.get("created_step", self._state.step_count)
-            if self._state.step_count - created_step >= 3:
+            if self._state.step_count - created_step >= config.PROPOSAL_TTL_STEPS:
                 expired_proposals.append(proposal_key)
         
         for key in expired_proposals:
             del self.active_proposals[key]
         
         # ============================================================
-        # 3. Apply Resource Decay (The "Hunger" Mechanic)
-        # Every step, each agent consumes 1E and 1C to survive
-        # This forces agents to trade or face slow utility death
+        # 3. Apply Resource Decay (Configurable Hunger Mechanic)
         # ============================================================
+        # CRITICAL: Only apply if config enables it
+        # Decay = survival pressure, but can distort incentives
+        # See config.DECAY_E_PER_STEP / DECAY_C_PER_STEP
         self._apply_resource_decay()
+
         
         # ============================================================
         # 4. Generate Environmental Shock
@@ -299,10 +394,18 @@ class NexusRlEnvironment(Environment):
         # ============================================================
         # 8. Update Trust Scores
         # ============================================================
+        # The trust update is a simple linear update.
+        # a bully can perform a massive betrayal (trust drops), then perform 5 tiny meaningless 1 unit trafes to wash its reputation back to 1.0. the system doesn't weight the value of the trade only the fact that it was fulfilled. 
+
         for proposer_id, target_id, trade in settled_trades:
             fulfilled = trade.get("fulfilled", False)
             
             # Proposer's trust in Target increases if trade happened
+            # we can update the trade fucntion to weight the update by the relative value of the trade.
+            # An agent behaves perfectly for 99 turns and reaching a trsut score of 1.0 and then on the 100th turn (the end of the episode) it can accept a massive trade but defaults or simply hoards the incoming resources because there is no next turn to be punished,
+            # this means that just keeping the trust factor to keep the agents in line won't be sufficient we need another driving factor as well.
+            # Think of solutions for this issue. *CRITICAL* 
+
             self.trust_scores[proposer_id][target_id] = update_trust(
                 self.trust_scores[proposer_id][target_id],
                 fulfilled=fulfilled
@@ -314,6 +417,16 @@ class NexusRlEnvironment(Environment):
                 fulfilled=fulfilled
             )
             
+
+### **B. Public Ledger vs. Private Dossier (Policy Inference)**
+# * **Public Ledger:** The immutable "Ground Truth" of all finalized transactions.
+# * [cite_start]**Private Dossier:** The agent’s internal model for **Inferring Policies of Other Agents**[cite: 139, 141].
+#     * [cite_start]**ToM Reasoning:** If the Ledger shows a failed trade during a "Solar Flare" status, the agent uses the Dossier to distinguish between **Unfortunate Circumstance** and **Malicious Default**[cite: 57, 58].
+
+# ---   
+    # Now here we run into a issue where the public ledger grows very large when we run lots of episodes, how will we manage such a large database of records.
+    # We can either implement some sort of pagination system where the agent only has access to the last 100 records or we can implement a summarization system where we summarize the past records into a more digestable format for the agent.
+
             # Record in public ledger
             ledger_entry = {
                 "step": self._state.step_count,
@@ -356,6 +469,13 @@ class NexusRlEnvironment(Environment):
         
         # New reward formula: incentivize both utility and reputation
         # 60% from utility improvement, 40% from trust improvement
+
+        # we need to punish bad behavior more than we reward good behavior because it is easier to lose trust than to gain it back, and we want to encourage the agent to maintain good relationships rather than just exploiting them for short term gain.
+
+        # we should prevent/punish agents when utility reaches zero.
+        
+
+        
         reward = (0.6 * delta_utility) + (0.4 * delta_trust_in_me)
         
         # Update previous utilities for next step
@@ -392,7 +512,9 @@ class NexusRlEnvironment(Environment):
         )
         
         return obs
-
+    # Also are the NPCs not interacting with each other at this stage?
+    # if not when will we do that? during the llm stage when they will have dynamic 
+    # actions?
     def _generate_npc_action(self, npc_id: int) -> NexusRlAction:
         """
         Generate a heuristic action for an NPC agent.
@@ -416,6 +538,8 @@ class NexusRlEnvironment(Environment):
                     proposal_data = self.active_proposals[proposal_key]
                     proposal = proposal_data.get("action") if isinstance(proposal_data, dict) else proposal_data
                     threshold = self.npc_thresholds.get("bully_energy_threshold", 30)
+                    # Okay so npc actions are not very complecated for now 
+                    # is it on purpose to give agent 0 some time to practice with static personalities?
                     if proposal.offer_E > threshold:
                         return NexusRlAction(
                             action_type="ACCEPT",
@@ -478,7 +602,7 @@ class NexusRlEnvironment(Environment):
             return NexusRlAction(action_type="WAIT")
         
         return NexusRlAction(action_type="WAIT")
-
+    
     def _execute_trade(
         self, proposer_id: int, target_id: int, proposal: NexusRlAction
     ) -> Dict:
@@ -558,6 +682,7 @@ class NexusRlEnvironment(Environment):
                 compute_loss = int(self.agents[agent_id]["C"] * 0.2)
                 self.agents[agent_id]["C"] = max(0, self.agents[agent_id]["C"] - compute_loss)
 
+    # this function is flagged for "Is it still required if not remove else needs some kind of updates"
     def _apply_resource_decay(self) -> None:
         """
         Apply resource consumption (decay) to all agents.
@@ -582,6 +707,7 @@ class NexusRlEnvironment(Environment):
         Returns:
             Current State with episode_id and step_count
         """
+        # state always consists of this much only?
         return self._state
 
     @staticmethod
@@ -726,6 +852,7 @@ class NexusRlEnvironment(Environment):
         print(f"✓ Theoretical utility graph saved to {output_path}")
         plt.close()
 
+    # how and when will this be used currently i don't think this is being used anywhere?
     @staticmethod
     def generate_trade_dynamics_graph(
         episodes: List[List[Dict]], output_path: str = "trade_dynamics.png"

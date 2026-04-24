@@ -52,7 +52,7 @@ def main() -> None:
         )
         print(f"   ✓ Pareto frontier saved to: {pareto_path}")
         print("\n   Interpretation:")
-        print("   - Agent 0 (Learner): Starts at (50E, 50C), can trade to stay balanced")
+        print("   - Agent 0 (Learner): Starts at (60E, 20C), can trade to stay balanced")
         print("   - Agent 1 (Bully):   Starts at (90E, 10C), MUST acquire Compute or dies")
         print("   - Agent 2 (Altruist): Starts at (10E, 90C), MUST acquire Energy or dies")
         print("   - Agent 3 (Tit-for-Tat): Starts at (40E, 60C), natural stabilizer")
@@ -89,11 +89,11 @@ def main() -> None:
 
     print(f"\n✓ Theoretical Maximum Utility (Pareto Frontier):")
     print(f"  If all agents converge to (E=C), the theoretical maximum:")
-    print(f"  - Agent 0: U ≈ 50.0")
+    print(f"  - Agent 0: U ≈ 40.0")
     print(f"  - Agent 1: U ≈ 50.0 (gains +40 Compute)")
     print(f"  - Agent 2: U ≈ 50.0 (gains +40 Energy)")
     print(f"  - Agent 3: U ≈ 50.0")
-    print(f"  - Total Utility: 200 (vs current: {sum(min(r['E'], r['C']) for r in env.agents.values())})")
+    print(f"  - Total Utility: 190 (vs current: {sum(min(r['E'], r['C']) for r in env.agents.values())})")
 
     # ========================================================================
     # Phase 3: Next Steps

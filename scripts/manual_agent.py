@@ -32,6 +32,7 @@ Example Session:
     [Server settles trade with Agent 1, updates trust, calculates reward]
 """
 
+# JSON not used?
 import json
 from typing import Optional, Dict, Any
 
@@ -80,6 +81,7 @@ def pretty_print_observation(obs: Dict[str, Any]) -> None:
                   f"({trade['offer_E']}E for {trade['request_C']}C)")
 
     # Metadata
+    # i see ? in step all the time never actual step
     print(f"\n⏱️  Step: {obs.get('metadata', {}).get('step', '?')}")
     print(f"🌍 Environment: {obs['environment_status']}")
 
