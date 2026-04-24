@@ -6,8 +6,9 @@
 
 """Nexus Rl Environment."""
 
-from .client import NexusRlEnv
-from .models import NexusRlAction, NexusRlObservation
+# Absolute imports for Colab compatibility
+from nexus_rl.client import NexusRlEnv
+from nexus_rl.models import NexusRlAction, NexusRlObservation
 
 __all__ = [
     "NexusRlAction",

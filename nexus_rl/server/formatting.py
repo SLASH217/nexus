@@ -21,7 +21,8 @@ This keeps prompt size O(n_agents) instead of O(n_agents * episode_length).
 
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
-from ..models import NexusRlObservation
+# Absolute import for Colab compatibility
+from nexus_rl.models import NexusRlObservation
 
 
 @dataclass
@@ -303,11 +304,18 @@ def format_observation_for_llm(
     lines.append("")
     
     # Current situation
+    # 1. Defensive resource retrieval
+    # Handles both the old 'E' key and the new 'E_available' locking keys
+    e_avail = obs.inventory.get('E_available', obs.inventory.get('E', 0))
+    c_avail = obs.inventory.get('C_available', obs.inventory.get('C', 0))
+    e_locked = obs.inventory.get('E_locked', 0)
+
     lines.append("CURRENT SITUATION:")
     lines.append(f"  Step: {obs.metadata.get('step', '?')}")
     lines.append(f"  Your Inventory:")
-    lines.append(f"    • Energy: {obs.inventory['E']} units")
-    lines.append(f"    • Compute: {obs.inventory['C']} units")
+    # We display both so the LLM understands it has 'reserved' energy
+    lines.append(f"    • Energy: {e_avail} units available (+{e_locked} locked)")
+    lines.append(f"    • Compute: {c_avail} units available")
     lines.append(f"  Your Utility Score: {obs.utility:.1f}")
     lines.append(f"    (Utility = min(Energy, Compute) - bottleneck resource matters!)")
     lines.append("")

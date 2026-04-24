@@ -23,14 +23,10 @@ from dataclasses import dataclass
 import gymnasium as gym
 from gymnasium import spaces
 
-try:
-    from .nexus_rl_environment import NexusRlEnvironment, ENVConfig
-    from .formatting import format_observation_for_llm
-    from ..models import NexusRlAction, NexusRlObservation
-except ImportError:
-    from nexus_rl_environment import NexusRlEnvironment, ENVConfig
-    from formatting import format_observation_for_llm
-    from models import NexusRlAction, NexusRlObservation
+# Absolute imports for Colab compatibility
+from nexus_rl.server.nexus_rl_environment import NexusRlEnvironment, ENVConfig
+from nexus_rl.server.formatting import format_observation_for_llm
+from nexus_rl.models import NexusRlAction, NexusRlObservation
 
 logger = logging.getLogger(__name__)
 
@@ -418,15 +414,23 @@ class NexusGymWrapper(gym.Env):
             self.logger.warning(f"Parse error (penalty): {parse_result.parse_error}")
         else:
             # Execute action
-            obs = self.env.step(action)
+            raw_obs = self.env.step(action)
             
-            # Calculate reward as ΔU
-            reward = obs.metadata.get("delta_utility", 0.0)
+            # 1. Use the pre-calculated delta_utility from the environment metadata
+            # Our environment already calculates this using Total Resources (Avail + Locked)
+            reward = raw_obs.metadata.get("delta_utility", 0.0)
             
-            # Apply penalty if action had validation errors
-            if self.last_validation_errors:
-                reward += self.invalid_action_penalty
+            # 2. Add System Welfare (The Social Welfare component)
+            # R = ΔU_self + λ * Σ(ΔU_others)
+            reward_breakdown = raw_obs.metadata.get("reward_breakdown", {})
+            total_reward = reward_breakdown.get("total", reward)
+            
+            # 3. Apply formatting penalty
+            if self.last_validation_errors or self.last_parse_error:
+                total_reward += self.invalid_action_penalty  # -1.0
                 self.logger.warning(f"Validation errors: {self.last_validation_errors}")
+            
+            reward = total_reward
         
         # Get next observation
         obs = self.env._current_obs if hasattr(self.env, '_current_obs') else self._get_current_obs()
@@ -458,10 +462,12 @@ class NexusGymWrapper(gym.Env):
         if hasattr(self.env, '_current_obs'):
             return self.env._current_obs
         
-        # Fallback: reconstruct from agent state
+        # Fallback: reconstruct from agent state (use new locking keys)
         inventory = {
-            'E': self.env.agents[self.agent_id].get('E_available', 0),
-            'C': self.env.agents[self.agent_id].get('C_available', 0),
+            'E_available': self.env.agents[self.agent_id].get('E_available', 0),
+            'E_locked': self.env.agents[self.agent_id].get('E_locked', 0),
+            'C_available': self.env.agents[self.agent_id].get('C_available', 0),
+            'C_locked': self.env.agents[self.agent_id].get('C_locked', 0),
         }
         
         utility = self.env._calculate_agent_utility(self.agent_id)

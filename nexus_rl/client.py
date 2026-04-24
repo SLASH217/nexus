@@ -12,7 +12,8 @@ from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import NexusRlAction, NexusRlObservation
+# Absolute import for Colab compatibility
+from nexus_rl.models import NexusRlAction, NexusRlObservation
 
 
 class NexusRlEnv(
