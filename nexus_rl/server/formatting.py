@@ -330,17 +330,9 @@ def format_observation_for_llm(
         bar = format_trust_bar(trust, width=15)
         name = agent_names.get(agent_id, f"Agent {agent_id}")
         
-        # Add personality hint
-        if agent_id == 1:
-            hint = "[Demands large offers]"
-        elif agent_id == 2:
-            hint = "[Desperate when low on Energy]"
-        elif agent_id == 3:
-            hint = "[Reciprocates fairly]"
-        else:
-            hint = ""
-        
-        lines.append(f"  Agent {agent_id} ({name}): {bar} {hint}")
+        # SECURITY: No personality hints to prevent LLM shortcutting
+        # Agents must infer personality from observed trading behavior, not from text labels
+        lines.append(f"  Agent {agent_id} ({name}): {bar}")
     lines.append("")
     
     # Recent trades (keep last N raw for tactical context)
