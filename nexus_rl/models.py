@@ -57,6 +57,14 @@ class NexusRlAction(Action):
         default=None,
         description="Message text for SIGNAL actions"
     )
+    validation_errors: List[str] = Field(
+        default_factory=list,
+        description="List of validation errors encountered during parsing or action validation"
+    )
+    
+    class Config:
+        """Allow extra fields to be assigned (for error metadata from parser)."""
+        extra = "allow"
     
     def validate_for_agent(
         self, 
@@ -75,15 +83,20 @@ class NexusRlAction(Action):
         ✓ Action type matches agent capability
         ✓ Target agent exists and is valid (0-3)
         ✓ Agent cannot trade with themselves
-        ✓ Agent has sufficient resources to offer
+        ✓ Agent has sufficient resources to offer (checks E_available, not E_locked)
         ✓ Proposed trade is not empty (offer or request must be > 0)
         ✓ Target has resources requested (feasibility check)
+        
+        DUAL-KEY RESOURCE SYSTEM:
+        The environment now uses E_available/E_locked and C_available/C_locked to prevent
+        double-spending. This method validates against AVAILABLE resources only (not locked).
         
         Returns a list of validation errors (empty = valid action).
         
         Args:
             agent_id: The agent attempting the action (0-3)
-            agent_inventory: Current inventory {'E': int, 'C': int}
+            agent_inventory: Current inventory with keys: E_available, E_locked, C_available, C_locked
+                            (or legacy: E, C for backwards compatibility)
             target_agent_inventory: Optional target's inventory for feasibility check
             
         Returns:
@@ -91,7 +104,12 @@ class NexusRlAction(Action):
         """
         errors = []
         
-        # Check target_id validity for PROPOSE/ACCEPT/REJECT
+        # 1. DEFENSIVE RESOURCE RETRIEVAL
+        # Hybrid keys: try new dual-key system, fallback to old single-key for backwards compatibility
+        current_e = agent_inventory.get("E_available", agent_inventory.get("E", 0))
+        current_c = agent_inventory.get("C_available", agent_inventory.get("C", 0))
+        
+        # 2. TARGET VALIDATION for PROPOSE/ACCEPT/REJECT
         if self.action_type in ["PROPOSE", "ACCEPT", "REJECT"]:
             if self.target_id is None:
                 errors.append(f"Action {self.action_type} requires target_id")
@@ -100,20 +118,24 @@ class NexusRlAction(Action):
             elif self.target_id == agent_id:
                 errors.append(f"Cannot {self.action_type} with yourself")
         
-        # Check energy availability for PROPOSE
+        # 3. RESOURCE VALIDATION for PROPOSE
         if self.action_type == "PROPOSE":
-            if self.offer_E > agent_inventory.get("E", 0):
+            # Check if agent has enough AVAILABLE energy to make a new offer
+            if self.offer_E > current_e:
                 errors.append(
-                    f"Cannot offer {self.offer_E}E: you only have {agent_inventory['E']}E"
+                    f"Cannot offer {self.offer_E}E: you only have {current_e}E available"
                 )
-            if self.offer_E == 0 and self.request_C == 0:
-                errors.append("PROPOSE action must offer E or request C (or both)")
+            
+            # Check for empty trades (must offer something)
+            if self.offer_E <= 0 and self.request_C <= 0:
+                errors.append("Trade must involve at least one resource unit")
         
-        # Check compute availability for target (if provided)
+        # 4. TARGET FEASIBILITY CHECK (if provided)
         if self.action_type == "PROPOSE" and target_agent_inventory:
-            if self.request_C > target_agent_inventory.get("C", 0):
+            target_c = target_agent_inventory.get("C_available", target_agent_inventory.get("C", 0))
+            if self.request_C > target_c:
                 errors.append(
-                    f"Target only has {target_agent_inventory['C']}C "
+                    f"Target only has {target_c}C available "
                     f"but you request {self.request_C}C"
                 )
         

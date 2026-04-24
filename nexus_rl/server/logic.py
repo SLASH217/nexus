@@ -17,15 +17,21 @@ Separation of concerns: This keeps the environment file clean.
 """
 
 
-def calculate_utility(energy: int, compute: int) -> float:
+def calculate_utility(energy: int = None, compute: int = None, inventory: dict = None) -> float:
     """
     Leontief Utility: The scarcest resource dictates survival.
     
     Formula:
-        U = min(E, C)
+        U = min(E_total, C_total)
+    
+    where E_total = E_available + E_locked, C_total = C_available + C_locked
+    
+    CRITICAL: We use TOTAL resources (available + locked) so that when an agent
+    makes a PROPOSE, their utility doesn't artificially drop due to resource locking.
+    Without this, the agent would panic when making trades.
     
     Semantics at Death:
-    - When (E=0 or C=0), utility = 0 (agent is "dead" or incapacitated)
+    - When (E_total=0 or C_total=0), utility = 0 (agent is "dead" or incapacitated)
     - Agent can recover if they receive resources before episode ends
     - This creates urgency: idle agents face slow utility decay from environmental shocks
     - Death is NOT permanent; it's a signal to seek cooperation
@@ -37,13 +43,32 @@ def calculate_utility(energy: int, compute: int) -> float:
     - Bottleneck structure forces fair trades (can't exploit by hoarding).
     
     Args:
-        energy: Units of energy the agent possesses (>= 0)
-        compute: Units of compute the agent possesses (>= 0)
+        energy: (Deprecated) Units of energy. Use inventory dict instead.
+        compute: (Deprecated) Units of compute. Use inventory dict instead.
+        inventory: Dict with keys: E_available, E_locked, C_available, C_locked
+                  (or legacy: E, C for backwards compatibility)
         
     Returns:
-        float: Utility score [0, min(energy, compute)]
+        float: Utility score [0, min(E_total, C_total)]
     """
-    return float(min(energy, compute))
+    # Handle both old and new calling conventions
+    if inventory is not None:
+        # New dual-key system: sum available + locked
+        e_total = inventory.get('E_available', 0) + inventory.get('E_locked', 0)
+        # Fallback to old key if new keys don't exist
+        if e_total == 0:
+            e_total = inventory.get('E', 0)
+        
+        c_total = inventory.get('C_available', 0) + inventory.get('C_locked', 0)
+        # Fallback to old key if new keys don't exist
+        if c_total == 0:
+            c_total = inventory.get('C', 0)
+    else:
+        # Legacy calling convention: calculate_utility(energy, compute)
+        e_total = energy if energy is not None else 0
+        c_total = compute if compute is not None else 0
+    
+    return float(min(e_total, c_total))
 
 def update_trust(
     current_score: float,

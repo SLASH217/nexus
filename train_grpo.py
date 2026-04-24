@@ -185,18 +185,23 @@ class RolloutCollector:
             # Execute action
             next_obs, reward, terminated, truncated, info = self.env.step(action_text)
             
+            # Apply time pressure penalty to prevent infinite waiting
+            # This encourages the agent to find trades sooner rather than later
+            time_penalty = -0.01 * step_idx  # Small penalty per step
+            final_reward = float(reward) + time_penalty
+            
             # Record step
             steps.append({
                 "observation": obs,
                 "action": action_text,
-                "reward": reward,
+                "reward": final_reward,  # Includes time pressure penalty
                 "terminated": terminated,
                 "truncated": truncated,
                 "info": info,
             })
             
-            episode_reward += reward
-            self.total_reward += reward
+            episode_reward += final_reward
+            self.total_reward += final_reward
             self.total_steps += 1
             
             obs = next_obs
@@ -358,17 +363,31 @@ def train_with_grpo(config: TrainingConfig) -> Dict:
     # 3. Initialize rollout collector
     collector = RolloutCollector(model, tokenizer, env, config)
     
-    # 4. Setup GRPO trainer
+    # 4. Setup GRPO trainer with VRAM OOM Shield
     training_args = GRPOConfig(
         output_dir=config.output_dir,
         learning_rate=config.learning_rate,
         num_train_epochs=config.num_train_epochs,
-        per_device_train_batch_size=config.batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        
+        # Memory Management - Critical for T4 GPU (16GB VRAM)
+        per_device_train_batch_size=1,  # Set to 1 to avoid OOM
+        gradient_accumulation_steps=4,  # Effective batch size = 4
+        max_prompt_length=512,  # Limit prompt context
+        max_completion_length=256,  # Limit LLM thought depth
+        
+        # Unsloth speed & memory optimizations
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
+        
         logging_steps=config.log_interval,
         save_steps=config.checkpoint_interval,
         save_strategy="steps",
         remove_unused_columns=False,
+        
+        # GPU memory utilization - leave 40% for rollout buffer
+        # (This parameter may not be available in all GRPOConfig versions,
+        # but is listed here for reference)
+        # gpu_memory_utilization=0.6,
     )
     
     trainer = GRPOTrainer(
