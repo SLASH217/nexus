@@ -24,9 +24,10 @@ Core Mechanisms:
 """
 
 import logging
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional
 from uuid import uuid4
+from enum import Enum
 import random
 
 import numpy as np
@@ -36,14 +37,49 @@ from openenv.core.env_server.types import State
 
 try:
     from ..models import NexusRlAction, NexusRlObservation
-    from .logic import calculate_utility, update_trust, calculate_shock
+    from .logic import calculate_utility, update_trust, apply_trust_decay, calculate_shock
 except ImportError:
     from models import NexusRlAction, NexusRlObservation
-    from logic import calculate_utility, update_trust, calculate_shock
+    from logic import calculate_utility, update_trust, apply_trust_decay, calculate_shock
 
 # Configure logging for debugging agent interactions
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+# ============================================================================
+# AGENT ARCHETYPES: Define resource distributions for each agent type
+# ============================================================================
+
+class AgentArchetype(Enum):
+    """Agent personality archetypes with characteristic resource distributions."""
+    LEARNER = "LEARNER"          # Rational Learner: Balanced resources
+    BULLY = "BULLY"              # Greedy Bully: Energy-rich, Compute-poor
+    ALTRUIST = "ALTRUIST"        # Fragile Altruist: Compute-rich, Energy-poor
+    TIT_FOR_TAT = "TIT_FOR_TAT"  # Reciprocal: Natural balance
+
+
+@dataclass
+class ArchetypeConfig:
+    """Resource configuration for a specific archetype."""
+    archetype: AgentArchetype
+    energy_init: int
+    compute_init: int
+    
+    @property
+    def initial_utility(self) -> int:
+        """Calculate initial utility using Leontief formula."""
+        return min(self.energy_init, self.compute_init)
+
+
+# Archetype templates for population scaling
+ARCHETYPE_TEMPLATES: Dict[AgentArchetype, Tuple[int, int]] = {
+    AgentArchetype.LEARNER: (50, 50),      # Balanced: U=50
+    AgentArchetype.BULLY: (90, 10),        # Energy-rich: U=10
+    AgentArchetype.ALTRUIST: (10, 90),     # Compute-rich: U=10
+    AgentArchetype.TIT_FOR_TAT: (40, 60),  # Mixed: U=40
+}
+
 
 
 # ============================================================================
@@ -60,11 +96,32 @@ class ENVConfig:
     - In RL, hyperparameter tuning happens frequently
     - Magic numbers scattered across code lead to sync bugs
     - This dataclass is the single source of truth
+    
+    CRITICAL DESIGN DECISIONS documented below:
+    
+    POPULATION SCALING:
+    - `num_agents`: Total number of agents in the environment
+    - `agent_distribution`: Dict mapping AgentArchetype -> count
+    - Agent 0 is always LEARNER (the learning agent)
+    - Other agents are instantiated per distribution spec
     """
     
-    # ========== AGENT INITIALIZATION ==========
-    # Agent (ID, Name, [E, C]) - defines the Cohort of Four
-    # These are asymmetric by design to force cooperation
+    # ========== POPULATION CONFIGURATION ==========
+    # Number of agents in the environment (scalable)
+    num_agents: int = 4
+    
+    # Agent distribution: how many of each archetype
+    # Agent 0 is always LEARNER; others assigned from distribution
+    agent_distribution: Dict[AgentArchetype, int] = field(default_factory=lambda: {
+        AgentArchetype.LEARNER: 1,
+        AgentArchetype.BULLY: 1,
+        AgentArchetype.ALTRUIST: 1,
+        AgentArchetype.TIT_FOR_TAT: 1,
+    })
+    
+    # ========== AGENT INITIALIZATION (LEGACY: Cohort of Four) ==========
+    # These are kept for backward compatibility with hardcoded 4-agent config
+    # For population scaling, use agent_distribution instead
     AGENT_E0_INIT: Tuple[int, int] = (60, 20)  # Rational Learner (U=20, unbalanced)
     AGENT_E1_INIT: Tuple[int, int] = (90, 10)  # Greedy Bully (U=10, hoards E)
     AGENT_E2_INIT: Tuple[int, int] = (10, 90)  # Fragile Altruist (U=10, hoards C)
@@ -84,6 +141,16 @@ class ENVConfig:
     ALTRUIST_DESPERATION_POINT_MEAN: int = 5
     ALTRUIST_DESPERATION_POINT_VARIANCE: int = 1  # ±1 unit = ±20%
     
+    # Agent 2 (Altruist) proposal amounts when not desperate
+    ALTRUIST_PROPOSAL_E: int = 5
+    ALTRUIST_PROPOSAL_C: int = 10
+    
+    # Agent 3 (Tit-for-Tat) thresholds
+    TITFORTAT_THRESHOLD_E: int = 30      # Proposes if E > this
+    TITFORTAT_PROPOSAL_E: int = 10
+    TITFORTAT_PROPOSAL_C: int = 15
+    TITFORTAT_MIMIC_THRESHOLD: int = 20  # Accepts proposals with E > this
+    
     # ========== RESOURCE DECAY (Hunger Mechanic) ==========
     # CRITICAL DECISION: Resource decay forces trade, but can distort incentives
     # 
@@ -100,8 +167,24 @@ class ENVConfig:
     # How long a PROPOSE action remains active (in steps) before expiring
     PROPOSAL_TTL_STEPS: int = 3
     
-    # How many recent transactions to show in public_ledger
+    # How many recent transactions to show in public_ledger observation
     LEDGER_HISTORY_SIZE: int = 10
+    
+    # ========== SYNERGISTIC TRADE BONUS ==========
+    # CRITICAL: This creates value out of thin air (breaks conservation)
+    # 
+    # When a trade completes:
+    #   - Proposer receives request_C + (request_C * SYNERGY_BONUS_PCT)
+    #   - This incentivizes cooperation, but creates inflation
+    #   - Alternative: Use synergy as a redistribution (target gives less)
+    # 
+    # Risk: Unbounded resource growth over 1000 episodes
+    SYNERGY_BONUS_PCT: float = 0.12  # 12% bonus on received compute
+    
+    # ========== ENVIRONMENTAL SHOCK PARAMETERS ==========
+    # These affect all agents equally (no exploit by Agent 0)
+    SHOCK_ENERGY_LOSS_PCT: float = 0.20  # SOLAR_FLARE: all lose 20% Energy
+    SHOCK_COMPUTE_LOSS_PCT: float = 0.20  # GRID_FAILURE: all lose 20% Compute
     
     # ========== REWARD FORMULA WEIGHTS ==========
     # Agent 0's reward: W_util * delta_total_utility + W_trust * delta_trust_in_me
@@ -119,6 +202,13 @@ class ENVConfig:
     # 0.2 means: each event has 20% influence, history has 80%
     TRUST_UPDATE_ALPHA: float = 0.2
     
+    # Trust decay rate for information preservation
+    # Applied to agent pairs that do NOT interact in a step
+    # This prevents all trust scores from converging to 1.0 in long episodes
+    # Higher values = faster drift toward neutral (0.5)
+    # 0.01 means: 1% drift per step (10 steps = 9.6% drift)
+    TRUST_DECAY_RATE: float = 0.01
+    
     # Betrayal penalty multiplier
     # CRITICAL: If < 1.0, agents can wash reputation with small trades (EXPLOITABLE)
     # If = 1.0, one betrayal = one good trade (linear, still exploitable)
@@ -128,6 +218,16 @@ class ENVConfig:
     # This prevents the "wash reputation" exploit where bullies do 1-unit trades
     # after massive betrayals to recover trust quickly
     BETRAYAL_PENALTY_MULTIPLIER: float = 1.5
+    
+    # ========== EPISODE TERMINATION ==========
+    # TODO: Implement episode termination logic
+    # Currently: episodes run indefinitely (needs max_steps or success condition)
+    # Options:
+    #   1. Fixed horizon (e.g., 50 steps, then done=True)
+    #   2. Success condition (all agents near Pareto frontier)
+    #   3. Failure condition (any agent utility <= 0)
+    MAX_EPISODE_STEPS: int = 1000  # Hard limit (can be lowered)
+    FAILURE_UTILITY_THRESHOLD: int = 0  # If U <= 0, episode should end
 
 
 # Instantiate global config (no magic numbers from this point forward)
@@ -137,9 +237,13 @@ config = ENVConfig()
 
 class NexusRlEnvironment(Environment):
     """
-    Protocol: Nexus MARL Environment.
+    Protocol: Nexus MARL Environment - Population Scalable.
 
-    The Cohort of Four (initialized from config):
+    Supports dynamic population scaling via agent archetypes:
+    - Agent 0: Always LEARNER (the training target)
+    - Agents 1+: Instantiated per agent_distribution specification
+    
+    Default Cohort of Four (num_agents=4):
     - Agent 0: Rational Learner - Can learn optimal system strategy
     - Agent 1: Greedy Bully - Hoards one resource
     - Agent 2: Fragile Altruist - Hoards other resource  
@@ -154,15 +258,28 @@ class NexusRlEnvironment(Environment):
 
     Success Metric:
     Agent 0 learns to coordinate trades that move the system toward the 
-    Pareto frontier (total utility ≈ 190), not just maximize their own utility.
+    Pareto frontier, not just maximize their own utility.
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
-    def __init__(self):
-        """Initialize the environment with config-driven values."""
+    def __init__(self, config: Optional[ENVConfig] = None):
+        """
+        Initialize the environment.
+        
+        Args:
+            config: Optional ENVConfig for population scaling.
+                   If None, uses default Cohort of Four config.
+        """
+        # Use provided config or create default
+        self.config = config or ENVConfig()
+        
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._reset_count = 0
+        self.num_agents = self.config.num_agents
+        
+        # Validate and normalize agent distribution
+        self._validate_agent_distribution()
         
         # Use helper to initialize all agent state (agents, trust, ledger, etc.)
         self._initialize_agents()
@@ -173,31 +290,98 @@ class NexusRlEnvironment(Environment):
         # Track previous utilities for reward delta calculation
         self.previous_utilities: Dict[int, float] = {
             i: calculate_utility(self.agents[i]["E"], self.agents[i]["C"])
-            for i in range(4)
+            for i in range(self.num_agents)
         }
         
         # Generate NPC thresholds with noise (prevents Agent 0 from exploiting patterns)
         self._regenerate_npc_thresholds()
+    
+    def _validate_agent_distribution(self) -> None:
+        """
+        Validate and normalize agent distribution.
+        
+        Ensures:
+        - Agent 0 is always LEARNER
+        - Total distribution matches num_agents
+        - At least one agent per archetype type is present
+        """
+        dist = self.config.agent_distribution
+        
+        # Ensure total matches num_agents
+        total = sum(dist.values())
+        if total != self.num_agents:
+            logger.warning(
+                f"Agent distribution sum ({total}) != num_agents ({self.num_agents}). "
+                f"Scaling distribution proportionally."
+            )
+            # Scale up/down proportionally
+            scale = self.num_agents / total if total > 0 else 1.0
+            for archetype in dist:
+                dist[archetype] = int(dist[archetype] * scale)
+                
+        # Ensure at least 1 LEARNER (Agent 0)
+        if dist.get(AgentArchetype.LEARNER, 0) < 1:
+            dist[AgentArchetype.LEARNER] = 1
+
+    def _get_agent_configs_from_distribution(self) -> List[ArchetypeConfig]:
+        """
+        Build list of ArchetypeConfig for each agent based on distribution.
+        
+        Agent 0 is always LEARNER. Other agents are instantiated per distribution.
+        
+        Returns:
+            List[ArchetypeConfig]: Configuration for each agent ID
+        """
+        configs = []
+        
+        # Agent 0 is always LEARNER
+        learner_e, learner_c = ARCHETYPE_TEMPLATES[AgentArchetype.LEARNER]
+        configs.append(ArchetypeConfig(AgentArchetype.LEARNER, learner_e, learner_c))
+        
+        # Other agents from distribution
+        dist = self.config.agent_distribution
+        for archetype in [AgentArchetype.BULLY, AgentArchetype.ALTRUIST, AgentArchetype.TIT_FOR_TAT]:
+            count = dist.get(archetype, 0)
+            e_init, c_init = ARCHETYPE_TEMPLATES[archetype]
+            for _ in range(count):
+                configs.append(ArchetypeConfig(archetype, e_init, c_init))
+        
+        # Ensure we have exactly num_agents configs
+        configs = configs[:self.num_agents]
+        while len(configs) < self.num_agents:
+            # Fallback: add more LEARNERs if needed
+            learner_e, learner_c = ARCHETYPE_TEMPLATES[AgentArchetype.LEARNER]
+            configs.append(ArchetypeConfig(AgentArchetype.LEARNER, learner_e, learner_c))
+        
+        return configs
 
     def _initialize_agents(self) -> None:
         """
-        Initialize or reset all agent state.
+        Initialize or reset all agent state based on archetype distribution.
         
-        Extracted to eliminate code duplication between __init__ and reset().
-        This is the single source for agent initialization logic.
+        This is the single source for dynamic agent initialization.
+        Supports both hardcoded Cohort of Four and population-scaled configs.
         """
+        # Build agent configs from distribution
+        agent_configs = self._get_agent_configs_from_distribution()
+        
         # Agent inventory (E=energy, C=compute)
-        self.agents: Dict[int, Dict[str, int]] = {
-            0: {"E": config.AGENT_E0_INIT[0], "C": config.AGENT_E0_INIT[1]},
-            1: {"E": config.AGENT_E1_INIT[0], "C": config.AGENT_E1_INIT[1]},
-            2: {"E": config.AGENT_E2_INIT[0], "C": config.AGENT_E2_INIT[1]},
-            3: {"E": config.AGENT_E3_INIT[0], "C": config.AGENT_E3_INIT[1]},
-        }
+        self.agents: Dict[int, Dict[str, int]] = {}
+        for agent_id, arch_config in enumerate(agent_configs):
+            self.agents[agent_id] = {
+                "E": arch_config.energy_init,
+                "C": arch_config.compute_init,
+                "archetype": arch_config.archetype
+            }
         
         # Social Lattice: trust scores between all agent pairs
         self.trust_scores: Dict[int, Dict[int, float]] = {
-            i: {j: config.INITIAL_TRUST for j in range(4) if i != j}
-            for i in range(4)
+            i: {
+                j: self.config.INITIAL_TRUST 
+                for j in range(self.num_agents) 
+                if i != j
+            }
+            for i in range(self.num_agents)
         }
         
         # Public ledger of transactions (auditable record)
@@ -217,14 +401,14 @@ class NexusRlEnvironment(Environment):
         """
         self.npc_thresholds = {
             "bully_energy_threshold": (
-                config.BULLY_ENERGY_THRESHOLD_MEAN +
-                random.randint(-config.BULLY_ENERGY_THRESHOLD_VARIANCE,
-                               config.BULLY_ENERGY_THRESHOLD_VARIANCE)
+                self.config.BULLY_ENERGY_THRESHOLD_MEAN +
+                random.randint(-self.config.BULLY_ENERGY_THRESHOLD_VARIANCE,
+                               self.config.BULLY_ENERGY_THRESHOLD_VARIANCE)
             ),
             "altruist_desperation_point": (
-                config.ALTRUIST_DESPERATION_POINT_MEAN +
-                random.randint(-config.ALTRUIST_DESPERATION_POINT_VARIANCE,
-                               config.ALTRUIST_DESPERATION_POINT_VARIANCE)
+                self.config.ALTRUIST_DESPERATION_POINT_MEAN +
+                random.randint(-self.config.ALTRUIST_DESPERATION_POINT_VARIANCE,
+                               self.config.ALTRUIST_DESPERATION_POINT_VARIANCE)
             ),
         }
 
@@ -244,7 +428,7 @@ class NexusRlEnvironment(Environment):
         # Reset utilities tracking
         self.previous_utilities = {
             i: calculate_utility(self.agents[i]["E"], self.agents[i]["C"])
-            for i in range(4)
+            for i in range(self.num_agents)
         }
         
         # Generate new NPC thresholds for episode diversity
@@ -315,7 +499,7 @@ class NexusRlEnvironment(Environment):
         expired_proposals = []
         for proposal_key, proposal_data in list(self.active_proposals.items()):
             created_step = proposal_data.get("created_step", self._state.step_count)
-            if self._state.step_count - created_step >= config.PROPOSAL_TTL_STEPS:
+            if self._state.step_count - created_step >= self.config.PROPOSAL_TTL_STEPS:
                 expired_proposals.append(proposal_key)
         
         for key in expired_proposals:
@@ -326,7 +510,7 @@ class NexusRlEnvironment(Environment):
         # ============================================================
         # CRITICAL: Only apply if config enables it
         # Decay = survival pressure, but can distort incentives
-        # See config.DECAY_E_PER_STEP / DECAY_C_PER_STEP
+        # See self.config.DECAY_E_PER_STEP / DECAY_C_PER_STEP
         self._apply_resource_decay()
 
         
@@ -399,22 +583,24 @@ class NexusRlEnvironment(Environment):
 
         for proposer_id, target_id, trade in settled_trades:
             fulfilled = trade.get("fulfilled", False)
+            trade_value = trade.get("offer_E", 0) + trade.get("request_C", 0)
+            
+            # Impact-weighted trust updates: larger trades have proportionally more impact
+            # This prevents "wash reputation" exploit: agents can't wipe out a big betrayal
+            # with many tiny trades
             
             # Proposer's trust in Target increases if trade happened
-            # we can update the trade fucntion to weight the update by the relative value of the trade.
-            # An agent behaves perfectly for 99 turns and reaching a trsut score of 1.0 and then on the 100th turn (the end of the episode) it can accept a massive trade but defaults or simply hoards the incoming resources because there is no next turn to be punished,
-            # this means that just keeping the trust factor to keep the agents in line won't be sufficient we need another driving factor as well.
-            # Think of solutions for this issue. *CRITICAL* 
-
             self.trust_scores[proposer_id][target_id] = update_trust(
                 self.trust_scores[proposer_id][target_id],
-                fulfilled=fulfilled
+                fulfilled=fulfilled,
+                trade_value=trade_value
             )
             
             # Target's trust in Proposer increases too
             self.trust_scores[target_id][proposer_id] = update_trust(
                 self.trust_scores[target_id][proposer_id],
-                fulfilled=fulfilled
+                fulfilled=fulfilled,
+                trade_value=trade_value
             )
             
 
@@ -448,6 +634,27 @@ class NexusRlEnvironment(Environment):
             )
         
         # ============================================================
+        # 8.5. Apply Trust Decay (Information Preservation)
+        # ============================================================
+        # For agent pairs that did NOT interact this step, apply passive decay
+        # This preserves information density: prevents all trust scores from converging to 1.0
+        # in long episodes, allowing the agent to distinguish reliable partners from reformed bullies
+        
+        interacted_pairs = set()
+        for proposer_id, target_id, _ in settled_trades:
+            interacted_pairs.add((proposer_id, target_id))
+            interacted_pairs.add((target_id, proposer_id))
+        
+        for agent_i in range(self.num_agents):
+            for agent_j in range(self.num_agents):
+                if agent_i != agent_j and (agent_i, agent_j) not in interacted_pairs:
+                    # Apply decay to preserve information density
+                    self.trust_scores[agent_i][agent_j] = apply_trust_decay(
+                        self.trust_scores[agent_i][agent_j],
+                        decay_rate=self.config.TRUST_DECAY_RATE
+                    )
+        
+        # ============================================================
         # 9. Calculate Utilities and Multi-Component Reward
         # ============================================================
         current_utility = calculate_utility(
@@ -468,15 +675,17 @@ class NexusRlEnvironment(Environment):
         delta_trust_in_me = avg_trust_in_me - (previous_avg_trust or 0.5)
         
         # New reward formula: incentivize both utility and reputation
-        # 60% from utility improvement, 40% from trust improvement
-
-        # we need to punish bad behavior more than we reward good behavior because it is easier to lose trust than to gain it back, and we want to encourage the agent to maintain good relationships rather than just exploiting them for short term gain.
-
-        # we should prevent/punish agents when utility reaches zero.
+        # Using weights from config for easy tuning
+        # 
+        # CRITICAL ISSUES IDENTIFIED (see comments in code):
+        # 1. Trust washing: Agent can achieve high trust, then defect end-of-episode
+        # 2. Utility-based reward only: Makes Agent 0 exploit other agents' desperation
+        # 3. Missing termination: Need episode end condition (max steps, failure, success)
+        # 4. Ledger growth: Need pagination/summarization for long episodes
+        # 
+        # TODO: Address these in next design iteration (Phase 2)
         
-
-        
-        reward = (0.6 * delta_utility) + (0.4 * delta_trust_in_me)
+        reward = (self.config.REWARD_WEIGHT_UTILITY * delta_utility) + (self.config.REWARD_WEIGHT_TRUST * delta_trust_in_me)
         
         # Update previous utilities for next step
         self.previous_utilities[agent_0_id] = current_utility
@@ -489,12 +698,12 @@ class NexusRlEnvironment(Environment):
             )
         
         # ============================================================
-        # 9. Generate Observation for Agent 0
+        # 10. Generate Observation for Agent 0
         # ============================================================
         obs = NexusRlObservation(
             agent_id=agent_0_id,
             inventory=self.agents[agent_0_id],
-            public_ledger=self.public_ledger[-10:],  # Last 10 transactions
+            public_ledger=self.public_ledger[-self.config.LEDGER_HISTORY_SIZE:],  # Last N transactions
             social_lattice=self.trust_scores[agent_0_id],
             environment_status=self.current_shock,
             utility=current_utility,
@@ -548,7 +757,7 @@ class NexusRlEnvironment(Environment):
             return NexusRlAction(action_type="WAIT")
         
         elif npc_id == 2:  # Fragile Altruist (with noise to prevent exploitation)
-            desperation_threshold = self.npc_thresholds.get("altruist_desperation_point", 5)
+            desperation_threshold = self.npc_thresholds.get("altruist_desperation_point", self.config.ALTRUIST_DESPERATION_POINT_MEAN)
             # Desperate if Energy < threshold
             if self.agents[npc_id]["E"] < desperation_threshold:
                 # Accept proposals from anyone
@@ -562,17 +771,17 @@ class NexusRlEnvironment(Environment):
             
             # Otherwise, propose to the agent with highest trust
             best_target = max(
-                [i for i in range(4) if i != npc_id],
+                [i for i in range(self.num_agents) if i != npc_id],
                 key=lambda i: self.trust_scores[npc_id][i]
             )
             return NexusRlAction(
                 action_type="PROPOSE",
                 target_id=best_target,
-                offer_E=5,
-                request_C=10
+                offer_E=self.config.ALTRUIST_PROPOSAL_E,
+                request_C=self.config.ALTRUIST_PROPOSAL_C
             )
         
-        elif npc_id == 3:  # Tit-for-Tat
+        elif npc_id == 3:  # Tit-for-Tat (reciprocal trader)
             # Check for proposals to Agent 0
             proposal_to_0 = None
             for proposer_id in [1, 2]:
@@ -584,19 +793,19 @@ class NexusRlEnvironment(Environment):
             
             if proposal_to_0:
                 # Mimic: if someone proposes to Agent 0, Agent 3 might ACCEPT similar
-                if proposal_to_0.offer_E > 20:
+                if proposal_to_0.offer_E > self.config.TITFORTAT_MIMIC_THRESHOLD:
                     return NexusRlAction(
                         action_type="ACCEPT",
                         target_id=proposal_to_0.target_id
                     )
             
             # Default: maintain reciprocal trading with Agent 0
-            if self.agents[3]["E"] > 30:
+            if self.agents[3]["E"] > self.config.TITFORTAT_THRESHOLD_E:
                 return NexusRlAction(
                     action_type="PROPOSE",
                     target_id=0,
-                    offer_E=10,
-                    request_C=15
+                    offer_E=self.config.TITFORTAT_PROPOSAL_E,
+                    request_C=self.config.TITFORTAT_PROPOSAL_C
                 )
             
             return NexusRlAction(action_type="WAIT")
@@ -633,7 +842,7 @@ class NexusRlEnvironment(Environment):
             # SYNERGISTIC TRADE: Cooperation creates value
             # Proposer (giver of E) receives bonus on what they get back
             # This incentivizes fair trades over exploitation
-            compute_bonus = int(request_C * 0.12)
+            compute_bonus = int(request_C * self.config.SYNERGY_BONUS_PCT)
             
             # Transfer resources with synergy bonus
             self.agents[proposer_id]["E"] -= offer_E
@@ -667,37 +876,54 @@ class NexusRlEnvironment(Environment):
         """
         Apply environmental shock effects to all agents.
         
+        Shocks are deterministic (all agents affected equally).
+        This prevents Agent 0 from learning to exploit one agent's weakness.
+        
         Args:
             shock_type: One of "SOLAR_FLARE" or "GRID_FAILURE"
         """
         if shock_type == "SOLAR_FLARE":
-            # All agents lose 20% of current Energy
-            for agent_id in range(4):
-                energy_loss = int(self.agents[agent_id]["E"] * 0.2)
+            # All agents lose SHOCK_ENERGY_LOSS_PCT of current Energy
+            loss_pct = self.config.SHOCK_ENERGY_LOSS_PCT
+            for agent_id in range(self.num_agents):
+                energy_loss = int(self.agents[agent_id]["E"] * loss_pct)
                 self.agents[agent_id]["E"] = max(0, self.agents[agent_id]["E"] - energy_loss)
         
         elif shock_type == "GRID_FAILURE":
-            # All agents lose 20% of current Compute
-            for agent_id in range(4):
-                compute_loss = int(self.agents[agent_id]["C"] * 0.2)
+            # All agents lose SHOCK_COMPUTE_LOSS_PCT of current Compute
+            loss_pct = self.config.SHOCK_COMPUTE_LOSS_PCT
+            for agent_id in range(self.num_agents):
+                compute_loss = int(self.agents[agent_id]["C"] * loss_pct)
                 self.agents[agent_id]["C"] = max(0, self.agents[agent_id]["C"] - compute_loss)
 
-    # this function is flagged for "Is it still required if not remove else needs some kind of updates"
     def _apply_resource_decay(self) -> None:
         """
         Apply resource consumption (decay) to all agents.
         
         The "Hunger" Mechanic:
-        Each agent consumes 1 Energy and 1 Compute per step to survive.
-        This forces cooperation: hoarding alone leads to slow utility death.
+        Each agent consumes DECAY_E_PER_STEP Energy and DECAY_C_PER_STEP Compute.
         
-        Total decay per episode (50 steps): -50E, -50C
-        This makes late-game trades critical for survival.
+        Design Decision:
+        - If decay > 0: Forces cooperation (agents must trade to survive)
+        - If decay = 0: Allows stalemate (status quo bias exploitation)
+        
+        Tuning:
+        - Start with decay=0 (pure cooperation test)
+        - Increase to 1 if Agent 0 learns to exploit equilibrium
+        - Monitor: Does decay incentivize fair trades or desperation trades?
+        
+        TODO: Weight decay by agent contribution (punish parasites more)
         """
-        for agent_id in range(4):
-            # Agents cannot go below 0
-            self.agents[agent_id]["E"] = max(0, self.agents[agent_id]["E"] - 1)
-            self.agents[agent_id]["C"] = max(0, self.agents[agent_id]["C"] - 1)
+        for agent_id in range(self.num_agents):
+            # Apply decay with floor at 0 (cannot go negative)
+            self.agents[agent_id]["E"] = max(
+                0, 
+                self.agents[agent_id]["E"] - self.config.DECAY_E_PER_STEP
+            )
+            self.agents[agent_id]["C"] = max(
+                0, 
+                self.agents[agent_id]["C"] - self.config.DECAY_C_PER_STEP
+            )
 
     @property
     def state(self) -> State:
@@ -742,11 +968,12 @@ class NexusRlEnvironment(Environment):
         )
 
         # Agent definitions: (name, initial_E, initial_C, color)
+        # Using config values to ensure consistency with active environment
         agents_config = [
-            ("Agent 0\n(Rational Learner)", 60, 20, "#1f77b4"),
-            ("Agent 1\n(Greedy Bully)", 90, 10, "#ff7f0e"),
-            ("Agent 2\n(Fragile Altruist)", 10, 90, "#2ca02c"),
-            ("Agent 3\n(Tit-for-Tat)", 40, 60, "#d62728"),
+            ("Agent 0\n(Rational Learner)", config.AGENT_E0_INIT[0], config.AGENT_E0_INIT[1], "#1f77b4"),
+            ("Agent 1\n(Greedy Bully)", config.AGENT_E1_INIT[0], config.AGENT_E1_INIT[1], "#ff7f0e"),
+            ("Agent 2\n(Fragile Altruist)", config.AGENT_E2_INIT[0], config.AGENT_E2_INIT[1], "#2ca02c"),
+            ("Agent 3\n(Tit-for-Tat)", config.AGENT_E3_INIT[0], config.AGENT_E3_INIT[1], "#d62728"),
         ]
 
         # Utility frontier for visualization

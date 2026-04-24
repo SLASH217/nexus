@@ -24,76 +24,134 @@ def calculate_utility(energy: int, compute: int) -> float:
     Formula:
         U = min(E, C)
     
+    Semantics at Death:
+    - When (E=0 or C=0), utility = 0 (agent is "dead" or incapacitated)
+    - Agent can recover if they receive resources before episode ends
+    - This creates urgency: idle agents face slow utility decay from environmental shocks
+    - Death is NOT permanent; it's a signal to seek cooperation
+    
     Intuition:
-    TOUCH: what happens if a agent dies is it out of the race completely?
-    what if it reaches 0 0 somehow?
     - If you have 100 Energy but 0 Compute, you're still dead (utility = 0).
     - Hoarding one resource is a losing strategy.
-    - This incentivizes **interdependence**.
+    - This incentivizes **interdependence**: you need both to survive.
+    - Bottleneck structure forces fair trades (can't exploit by hoarding).
     
     Args:
-        energy: Units of energy the agent possesses
-        compute: Units of compute the agent possesses
+        energy: Units of energy the agent possesses (>= 0)
+        compute: Units of compute the agent possesses (>= 0)
         
     Returns:
-        float: Utility score (always >= 0)
+        float: Utility score [0, min(energy, compute)]
     """
     return float(min(energy, compute))
 
-# something like impact = alpha * trade_value / max_resource_count to fix the linear update of the trust function this prevents big betrayals and some good behavior from cancelling out.
-# return impact * target + (1 - impact) * current_score
-
-# In long runs where agent learns to be nice everyone's trust score ewill eventually hit 1 at this point the social lattice loses all information density an agent can't distinguish between a long term reliable partner and a former bully who just started behaving recently.
-# this means the trust variable kind of becomes useless in the later portion of the episodes.
-# One proposed solution for this is :
-# the trust should naturally drift towards a neutral of 0.5 over time if there are no interactions, this way an agent that was once a bully but has been behaving for a while will have a trust score that reflects that history, and a long term reliable partner will also have a score that reflects their history. This also means that an agent that was once reliable but has recently started behaving badly will have a score that reflects that change in behavior. This way the trust variable retains its information density throughout the episode.
 def update_trust(
     current_score: float,
     fulfilled: bool,
-    alpha: float = 0.2
+    alpha: float = 0.2,
+    trade_value: int = 1,
+    max_resource: int = 100
 ) -> float:
     """
-    Social Lattice trust update.
+    Social Lattice trust update with impact weighting.
+    
+    CRITICAL: This prevents the "wash reputation" exploit.
     
     Formula:
-        T_new = alpha * target + (1 - alpha) * T_old
+        impact = alpha * (trade_value / max_resource)
+        T_new = impact * target + (1 - impact) * T_old
         
     Where:
         target = 1.0 if fulfilled else 0.0
-        alpha = learning rate (default: 0.2)
+        alpha = base learning rate (0.2 default)
+        trade_value = resource quantity involved (1-100)
+        max_resource = largest possible trade (100)
+        
+    Why impact weighting?
+    - Naive EMA: 1 betrayal of 50E + 2 small trades of 5E each washes reputation
+    - Impact weighting: 50E betrayal has 50x more impact → needs 50 small trades to recover
+    - Prevents agents from doing large betrayals then quickly "resetting" with small trades
     
     Intuition:
-    - Each interaction updates the trust score incrementally.
-    - A successful trade slowly builds trust (exponential moving average).
-    - A default *immediately* signals betrayal.
-    - Alpha of 0.2 means each interaction has 20% influence; history has 80%.
+    - Big trades (50E) should signal more about trustworthiness than small ones (1E)
+    - Alpha of 0.2 at full trade means 20% influence
+    - Alpha of 0.004 at tiny trade means 0.4% influence (requires many trades to recover)
+    - Creates realistic reputation dynamics
     
     Args:
         current_score: Previous trust score [0.0, 1.0]
         fulfilled: Did the agent honor their commitment?
-        alpha: Learning rate (higher = faster trust changes)
+        alpha: Base learning rate (higher = faster changes)
+        trade_value: Resources involved in this trade (1-100)
+        max_resource: Maximum possible trade amount for normalization
         
     Returns:
         float: Updated trust score [0.0, 1.0]
     """
-    # is this the correct formula?
+    # Compute impact-weighted learning rate
+    impact = alpha * (max(1, min(trade_value, max_resource)) / max_resource)
+    
+    # Standard EMA with impact weighting
     target = 1.0 if fulfilled else 0.0
-    new_score = (alpha * target) + (1.0 - alpha) * current_score
+    new_score = (impact * target) + (1.0 - impact) * current_score
+    
     return max(0.0, min(1.0, new_score))  # Clamp to [0.0, 1.0]
 
 
-# update suggestion 
-# Shocks should be resource specific and asymmetric. suppose a solar flare should not just hit everyone it should hit the "engery produceer" harder forcing them to  become a beggar and reversing the power dynamic
+def apply_trust_decay(current_score: float, decay_rate: float = 0.001) -> float:
+    """
+    Apply passive trust decay when agents don't interact.
+    
+    PROBLEM SOLVED: Information density preservation in long episodes.
+    
+    In long RL episodes, if agents cooperate throughout, all trust scores converge to 1.0.
+    At this point, the Social Lattice loses all discriminative power:
+    - Can't distinguish between long-term reliable partners and recent reformers
+    - Trust becomes "useless" for decision-making in late episodes
+    - LLM training signal becomes noise
+    
+    Solution: Natural drift back to 0.5 (neutral) when not interacting.
+    This preserves history and keeps trust scores meaningful:
+    - 1.0 score + no interaction → slowly drifts back to 0.5
+    - 0.0 score + good behavior → slowly drifts toward 0.5 then up
+    - Recently betrayed but reformed partner → score reflects their pattern
+    
+    Args:
+        current_score: Previous trust score [0.0, 1.0]
+        decay_rate: How quickly to drift toward 0.5 per step (default 0.1%)
+        
+    Returns:
+        float: Decayed trust score [0.0, 1.0]
+    """
+    # Linear drift toward 0.5 (neutral point)
+    neutral = 0.5
+    decayed = current_score + decay_rate * (neutral - current_score)
+    return max(0.0, min(1.0, decayed))
+
+
 def calculate_shock() -> str:
     """
     Environmental shock generator (stochastic).
     
+    Current Implementation (Symmetric):
     Probability per step:
     - 85% chance: "NORMAL" (standard trading)
     - 10% chance: "SOLAR_FLARE" (all agents lose 20% Energy)
     - 5% chance: "GRID_FAILURE" (all agents lose 20% Compute)
     
-    These shocks force agents to renegotiate and test cooperation under pressure.
+    Justification:
+    - Simple, fair shocks test whether cooperation survives adversity
+    - Everyone faces same pressure, forcing genuine negotiation
+    - Asymmetric shocks risk creating permanent "victim" agents
+    
+    Future Improvement (Asymmetric):
+    Could hit agents with surplus resources harder:
+    - SOLAR_FLARE hits Agent 1 (high E) 50% harder than others
+    - GRID_FAILURE hits Agent 2 (high C) 50% harder than others
+    - Reverses power dynamics, tests fairness and reciprocity
+    - Requires careful tuning to avoid breaking game balance
+    
+    TODO: Evaluate asymmetric shocks in Phase 2 (after LLM training validation)
     
     Returns:
         str: Shock status - one of "NORMAL", "SOLAR_FLARE", "GRID_FAILURE"

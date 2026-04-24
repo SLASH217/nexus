@@ -12,8 +12,7 @@ These Pydantic models ensure type safety and prevent hallucination noise.
 """
 
 from openenv.core.env_server.types import Action, Observation
-# BaseModel import seems to be unused here.
-from pydantic import BaseModel, Field
+from pydantic import Field
 from typing import Dict, List, Literal, Optional
 
 
@@ -21,13 +20,19 @@ class NexusRlAction(Action):
     """
     The structured command sent by an agent.
     
+    Design Note: Why only E→C trades, not C→E?
+    - Leontief utility: U = min(E, C) means both resources are required
+    - Natural asymmetry emerges: E producers seek C, C producers seek E
+    - Agent 1 hoards E (high E, low C) → naturally wants C
+    - Agent 2 hoards C (low E, high C) → naturally wants E
+    - This asymmetry creates the negotiation pressure that drives learning
+    - Allowing C→E trades would create symmetric bartering (loses structure)
+    
     Action types:
-    Can we only offer trade for E for C? Not the other way around C for E?
-    If yes why restricting here?
-    - PROPOSE: Offer a trade (E for C)
+    - PROPOSE: Offer energy (E) in exchange for compute (C)
     - ACCEPT: Accept a pending proposal
-    - REJECT: Decline a proposal
-    - SIGNAL: Send a message to the lattice
+    - REJECT: Decline a proposal  
+    - SIGNAL: Send a message to the lattice (future use)
     - WAIT: Do nothing this turn
     """
     
@@ -43,7 +48,6 @@ class NexusRlAction(Action):
         ge=0,
         description="Energy offered in a PROPOSE action"
     )
-    # What is the Field is it like a list?
     request_C: int = Field(
         default=0,
         ge=0,
@@ -53,9 +57,7 @@ class NexusRlAction(Action):
         default=None,
         description="Message text for SIGNAL actions"
     )
-    # have we used the validation properly and exhaustively everywhere 
-    # Because preventing invalid inputs from reaching the functions itself is very important 
-    # so validation should have not have any holes 
+    
     def validate_for_agent(
         self, 
         agent_id: int, 
@@ -65,15 +67,27 @@ class NexusRlAction(Action):
         """
         Validate that an action is legal for a given agent.
         
-        Returns a list of validation errors (empty = valid).
+        SECURITY CRITICAL: This validation prevents LLM hallucinations from reaching game logic.
+        It's called in step() before any state modifications, ensuring invalid actions
+        fail safely with error feedback (instead of silently failing or causing exceptions).
+        
+        Validation Coverage:
+        ✓ Action type matches agent capability
+        ✓ Target agent exists and is valid (0-3)
+        ✓ Agent cannot trade with themselves
+        ✓ Agent has sufficient resources to offer
+        ✓ Proposed trade is not empty (offer or request must be > 0)
+        ✓ Target has resources requested (feasibility check)
+        
+        Returns a list of validation errors (empty = valid action).
         
         Args:
-            agent_id: The agent attempting the action
+            agent_id: The agent attempting the action (0-3)
             agent_inventory: Current inventory {'E': int, 'C': int}
-            target_agent_inventory: Optional target's inventory for validation
+            target_agent_inventory: Optional target's inventory for feasibility check
             
         Returns:
-            List[str]: Error messages (empty = valid action)
+            List[str]: Human-readable error messages (empty list = valid action)
         """
         errors = []
         

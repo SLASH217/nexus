@@ -12,10 +12,90 @@ semantic-rich natural language narratives that LLMs can reason over efficiently.
 
 This module implements the "Text-In, Text-Out" interface needed for
 seamless LLM integration with the Nexus MARL environment.
+
+Key Feature: AgentDossier System
+Instead of sending full transaction history (token explosion risk),
+we maintain compressed historical summaries for each agent.
+This keeps prompt size O(n_agents) instead of O(n_agents * episode_length).
 """
 
 from typing import List, Dict, Optional
+from dataclasses import dataclass, field
 from ..models import NexusRlObservation
+
+
+@dataclass
+class AgentDossier:
+    """
+    Compressed historical summary for a single agent.
+    
+    This replaces the need to send the full ledger by maintaining
+    aggregate statistics about an agent's trading behavior.
+    
+    Attributes:
+        agent_id: The agent identifier
+        total_proposals: Total number of trade proposals made
+        fulfilled_trades: Number of successfully completed trades
+        default_count: Number of times the agent failed to honor a trade
+        total_energy_offered: Cumulative energy this agent has offered
+        total_compute_offered: Cumulative compute this agent has offered
+        total_energy_received: Cumulative energy received
+        total_compute_received: Cumulative compute received
+        reciprocity_score: How often they accept when surplus (0.0-1.0)
+        is_active: Whether the agent has made any trades recently
+    """
+    agent_id: int
+    total_proposals: int = 0
+    fulfilled_trades: int = 0
+    default_count: int = 0
+    total_energy_offered: int = 0
+    total_compute_offered: int = 0
+    total_energy_received: int = 0
+    total_compute_received: int = 0
+    reciprocity_score: float = 0.5  # Neutral default
+    is_active: bool = False
+    
+    @property
+    def success_rate(self) -> float:
+        """Calculate success rate: fulfilled / total proposals."""
+        if self.total_proposals == 0:
+            return 0.0
+        return self.fulfilled_trades / self.total_proposals
+    
+    @property
+    def default_rate(self) -> float:
+        """Calculate default rate: defaults / total proposals."""
+        if self.total_proposals == 0:
+            return 0.0
+        return self.default_count / self.total_proposals
+    
+    @property
+    def volume_score(self) -> int:
+        """Total resources moved (energy + compute)."""
+        return (self.total_energy_offered + self.total_compute_offered +
+                self.total_energy_received + self.total_compute_received)
+    
+    def format_for_prompt(self, agent_names: Optional[Dict[int, str]] = None) -> str:
+        """
+        Format dossier as human-readable summary for LLM context.
+        
+        Args:
+            agent_names: Optional mapping of agent_id -> name
+            
+        Returns:
+            str: Formatted dossier summary
+        """
+        name = agent_names.get(self.agent_id, f"Agent {self.agent_id}") if agent_names else f"Agent {self.agent_id}"
+        
+        success_pct = self.success_rate * 100 if self.total_proposals > 0 else 0
+        reciprocity_indicator = "🤝" if self.reciprocity_score > 0.7 else "🚩" if self.reciprocity_score < 0.3 else "⚖️"
+        
+        return (
+            f"  {name} ({self.agent_id}): {self.total_proposals} proposals, "
+            f"{success_pct:.0f}% success, "
+            f"Volume: {self.volume_score} units moved, "
+            f"Reciprocity: {self.reciprocity_score:.2f} {reciprocity_indicator}"
+        )
 
 
 def format_trust_bar(score: float, width: int = 20) -> str:
@@ -95,19 +175,94 @@ def calculate_social_proof(ledger: List[Dict]) -> str:
     )
 
 
+def build_agent_dossiers(
+    ledger: List[Dict],
+    num_agents: int
+) -> Dict[int, AgentDossier]:
+    """
+    Build compressed agent dossiers from transaction ledger.
+    
+    This is the core compression mechanism: converts O(episode_length) data
+    into O(num_agents) summary statistics.
+    
+    Args:
+        ledger: Full transaction history from the environment
+        num_agents: Total number of agents in the system
+        
+    Returns:
+        Dict[int, AgentDossier]: Dossier for each agent
+    """
+    # Initialize empty dossiers
+    dossiers = {i: AgentDossier(agent_id=i) for i in range(num_agents)}
+    
+    if not ledger:
+        return dossiers
+    
+    # Process each transaction
+    for trade in ledger:
+        proposer_id = trade.get("proposer")
+        target_id = trade.get("target")
+        fulfilled = trade.get("fulfilled", False)
+        
+        if proposer_id is None or target_id is None:
+            continue
+        
+        offer_e = trade.get("offer_E", 0)
+        request_c = trade.get("request_C", 0)
+        
+        # Update proposer dossier
+        proposer_dossier = dossiers[proposer_id]
+        proposer_dossier.total_proposals += 1
+        proposer_dossier.total_energy_offered += offer_e
+        proposer_dossier.total_compute_offered += request_c  # What they requested
+        proposer_dossier.is_active = True
+        
+        if fulfilled:
+            proposer_dossier.fulfilled_trades += 1
+            # When fulfilled, they received the requested compute
+            proposer_dossier.total_compute_received += request_c
+        else:
+            proposer_dossier.default_count += 1
+        
+        # Update target dossier (what they received if accepted)
+        target_dossier = dossiers[target_id]
+        if fulfilled:
+            target_dossier.total_energy_received += offer_e
+            target_dossier.total_compute_offered += request_c  # They gave compute
+            target_dossier.is_active = True
+    
+    # Calculate reciprocity scores
+    # Reciprocity: How often an agent accepts when they have surplus
+    # This requires analyzing recent behavior patterns
+    for agent_id, dossier in dossiers.items():
+        if dossier.total_proposals == 0:
+            dossier.reciprocity_score = 0.5
+        else:
+            # Simple heuristic: reciprocity is tied to success rate
+            # High success rate + active participation = reciprocal behavior
+            dossier.reciprocity_score = min(1.0, dossier.success_rate + 0.2)
+    
+    return dossiers
+
+
 def format_observation_for_llm(
     obs: NexusRlObservation,
     agent_names: Optional[Dict[int, str]] = None,
-    full_ledger: Optional[List[Dict]] = None
+    full_ledger: Optional[List[Dict]] = None,
+    num_agents: int = 4
 ) -> str:
     """
     Convert NexusRlObservation into a high-quality natural language prompt.
     
     This is the critical interface for LLM reasoning. The output should be:
     - Semantic: Clear intent and relationships
-    - Concise: Minimize token overhead
+    - Concise: Minimize token overhead (uses dossiers, not full ledger)
     - Actionable: Show exactly what actions are possible
     - Contextual: Include reasoning hints
+    
+    DESIGN PRINCIPLE: This function scales to arbitrary num_agents by using
+    compressed dossiers instead of full transaction history. Prompt size
+    is O(num_agents) not O(episode_length).
     
     Args:
         obs: The NexusRlObservation from the environment
@@ -115,11 +270,12 @@ def format_observation_for_llm(
                     Defaults to standard Cohort of Four names.
         full_ledger: Optional full ledger for social proof calculations.
                     If None, uses obs.public_ledger only.
+        num_agents: Total number of agents in the system (for dossier building)
         
     Returns:
         str: Formatted prompt ready for LLM input
     """
-    # Default agent personalities
+    # Default agent personalities (Cohort of Four)
     if agent_names is None:
         agent_names = {
             0: "Rational Learner (You)",
@@ -129,6 +285,9 @@ def format_observation_for_llm(
         }
     
     ledger = full_ledger or obs.public_ledger
+    
+    # Build dossiers: compressed historical summaries
+    dossiers = build_agent_dossiers(ledger, num_agents)
     
     # Build the narrative
     lines = []
@@ -184,12 +343,21 @@ def format_observation_for_llm(
         lines.append(f"  Agent {agent_id} ({name}): {bar} {hint}")
     lines.append("")
     
-    # Recent trades
+    # Recent trades (keep last N raw for tactical context)
     lines.append("RECENT TRADES (Last 5):")
     lines.append(format_recent_trades(obs.public_ledger, max_entries=5))
     lines.append("")
     
-    # Social proof (grid-wide statistics)
+    # Agent Dossiers: COMPRESSED historical summaries
+    lines.append("AGENT DOSSIERS (Historical Summary):")
+    lines.append("  [Success Rate | Volume | Reciprocity Pattern]")
+    for agent_id in range(num_agents):
+        if agent_id != obs.agent_id:  # Don't include self
+            dossier = dossiers[agent_id]
+            lines.append(dossier.format_for_prompt(agent_names))
+    lines.append("")
+    
+    # Grid statistics (still useful for Pareto context)
     lines.append("GRID STATISTICS:")
     lines.append(f"  {calculate_social_proof(ledger or obs.public_ledger)}")
     lines.append("")
@@ -198,7 +366,7 @@ def format_observation_for_llm(
     lines.append("STRATEGIC INSIGHT:")
     lines.append("  • Optimal scenario: All agents reach ~60+ utility (Pareto frontier)")
     lines.append("  • Current combined utility: ~{sum_util:.0f} / ~220 max".format(
-        sum_util=obs.utility * 4  # Rough estimate
+        sum_util=obs.utility * num_agents  # Rough estimate
     ))
     lines.append("  • Strategy: Cooperation with fair trades builds trust and mutual survival")
     lines.append("")
