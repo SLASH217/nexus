@@ -170,29 +170,35 @@ class ENVConfig:
     # How many recent transactions to show in public_ledger observation
     LEDGER_HISTORY_SIZE: int = 10
     
-    # ========== SYNERGISTIC TRADE BONUS ==========
-    # CRITICAL: This creates value out of thin air (breaks conservation)
+    # ========== SYNERGY BONUS (DISABLED) ==========
+    # REMOVED: The 12% synergy bonus created resources from nothing,
+    # breaking scarcity and Leontief utility. Resource conservation
+    # is fundamental to the game theory (Pareto frontier).
     # 
-    # When a trade completes:
-    #   - Proposer receives request_C + (request_C * SYNERGY_BONUS_PCT)
-    #   - This incentivizes cooperation, but creates inflation
-    #   - Alternative: Use synergy as a redistribution (target gives less)
-    # 
-    # Risk: Unbounded resource growth over 1000 episodes
-    SYNERGY_BONUS_PCT: float = 0.12  # 12% bonus on received compute
+    # Game rules now enforce strict conservation:
+    # - Proposer gives E, receives C (no bonus)
+    # - Target gives C, receives E
+    # - Total E and C in system remains constant
+    SYNERGY_BONUS_PCT: float = 0.0  # Disabled
     
     # ========== ENVIRONMENTAL SHOCK PARAMETERS ==========
     # These affect all agents equally (no exploit by Agent 0)
     SHOCK_ENERGY_LOSS_PCT: float = 0.20  # SOLAR_FLARE: all lose 20% Energy
     SHOCK_COMPUTE_LOSS_PCT: float = 0.20  # GRID_FAILURE: all lose 20% Compute
     
-    # ========== REWARD FORMULA WEIGHTS ==========
-    # Agent 0's reward: W_util * delta_total_utility + W_trust * delta_trust_in_me
+    # ========== REWARD FORMULA ==========
+    # Agent 0's reward: R = ΔU (change in agent's own utility)
     # 
-    # CRITICAL: We reward total utility, not just Agent 0's utility
-    # This incentivizes system optimization over pure self-interest
-    REWARD_WEIGHT_UTILITY: float = 0.6  # Focus on system utility improvement
-    REWARD_WEIGHT_TRUST: float = 0.4    # Focus on own reputation
+    # CRITICAL DESIGN DECISION:
+    # - Reward is purely utility-based (ΔU) to enforce direct incentive alignment
+    # - Trust is NOT in the reward function (prevents wash-trade farming)
+    # - Trust exists EXCLUSIVELY in the observation space as an instrumental variable
+    # - Agents learn to value reputation through indirect effects:
+    #   * High trust → more favorable proposals → higher future utility
+    #   * Low trust → fewer opportunities → lower future utility
+    # - This is the correct separation: reward the outcome, not the intermediate state
+    REWARD_WEIGHT_UTILITY: float = 1.0  # Pure utility reward (ΔU)
+    REWARD_WEIGHT_TRUST: float = 0.0    # Trust NOT rewarded (prevents gaming)
     
     # ========== TRUST UPDATE PARAMETERS ==========
     # Alpha in trust update: T_new = alpha * target + (1-alpha) * T_old
@@ -228,6 +234,16 @@ class ENVConfig:
     #   3. Failure condition (any agent utility <= 0)
     MAX_EPISODE_STEPS: int = 1000  # Hard limit (can be lowered)
     FAILURE_UTILITY_THRESHOLD: int = 0  # If U <= 0, episode should end
+    
+    # ========== EXECUTION FAIRNESS ==========
+    # First-mover advantage prevention
+    # 
+    # Problem: Fixed action order (Agent 0 always processes first) creates
+    # a permanent advantage in proposal buffer matching.
+    # 
+    # Solution: Warmup period for debugging, then random shuffle
+    WARMUP_EPISODES: int = 1000  # Fixed order for first N episodes
+    SHUFFLE_ACTION_ORDER_AFTER_WARMUP: bool = True  # Random shuffle after warmup
 
 
 # Instantiate global config (no magic numbers from this point forward)
@@ -288,10 +304,10 @@ class NexusRlEnvironment(Environment):
         self.active_proposals: Dict[str, Dict] = {}
         
         # Track previous utilities for reward delta calculation
-        self.previous_utilities: Dict[int, float] = {
-            i: calculate_utility(self.agents[i]["E"], self.agents[i]["C"])
-            for i in range(self.num_agents)
-        }
+        self.previous_utilities: Dict[int, float] = {}
+        for i in range(self.num_agents):
+            total_e, total_c = self._get_agent_total_resources(i)
+            self.previous_utilities[i] = calculate_utility(total_e, total_c)
         
         # Generate NPC thresholds with noise (prevents Agent 0 from exploiting patterns)
         self._regenerate_npc_thresholds()
@@ -361,16 +377,30 @@ class NexusRlEnvironment(Environment):
         
         This is the single source for dynamic agent initialization.
         Supports both hardcoded Cohort of Four and population-scaled configs.
+        
+        INVENTORY LOCKING SYSTEM:
+        Each agent has two resource pools:
+        - Available: Can be locked or freely traded
+        - Locked: Reserved for active proposals (cannot be used elsewhere)
+        
+        Transition: Available -> Locked (on PROPOSE)
+                    Locked -> Transferred (on ACCEPT)
+                    Locked -> Available (on REJECT or EXPIRE)
         """
         # Build agent configs from distribution
         agent_configs = self._get_agent_configs_from_distribution()
         
-        # Agent inventory (E=energy, C=compute)
+        # Agent inventory with locking (DOUBLE-SPENDING PREVENTION)
         self.agents: Dict[int, Dict[str, int]] = {}
         for agent_id, arch_config in enumerate(agent_configs):
             self.agents[agent_id] = {
-                "E": arch_config.energy_init,
-                "C": arch_config.compute_init,
+                # Energy: split into available and locked pools
+                "E_available": arch_config.energy_init,
+                "E_locked": 0,
+                # Compute: split into available and locked pools
+                "C_available": arch_config.compute_init,
+                "C_locked": 0,
+                # Metadata
                 "archetype": arch_config.archetype
             }
         
@@ -389,6 +419,73 @@ class NexusRlEnvironment(Environment):
         
         # Environmental state (shock status)
         self.current_shock = "NORMAL"
+    
+    def _get_agent_total_resources(self, agent_id: int) -> tuple:
+        """
+        Get total resources (available + locked) for an agent.
+        
+        Used for:
+        - Utility calculation (should reflect total holdings)
+        - Display/observation (what does agent actually own?)
+        
+        NOT used for:
+        - Validation checks (those use available only)
+        - PROPOSE validation (can only lock available)
+        
+        Returns:
+            Tuple[int, int]: (total_energy, total_compute)
+        """
+        agent = self.agents[agent_id]
+        return (
+            agent.get("E_available", 0) + agent.get("E_locked", 0),
+            agent.get("C_available", 0) + agent.get("C_locked", 0)
+        )
+    
+    def _get_agent_available_resources(self, agent_id: int) -> tuple:
+        """
+        Get available (unlocked) resources for an agent.
+        
+        Used for:
+        - Validation before PROPOSE
+        - Checking if agent can afford a trade
+        
+        Returns:
+            Tuple[int, int]: (available_energy, available_compute)
+        """
+        agent = self.agents[agent_id]
+        return (
+            agent.get("E_available", 0),
+            agent.get("C_available", 0)
+        )
+    
+    def _lock_resources(self, agent_id: int, energy: int, compute: int) -> bool:
+        """
+        Lock resources for a pending PROPOSE.
+        
+        Args:
+            agent_id: Agent ID
+            energy: Energy to lock
+            compute: Compute to lock (not used, but kept for symmetry)
+            
+        Returns:
+            bool: True if lock successful, False if insufficient available
+        """
+        agent = self.agents[agent_id]
+        available_e, _ = self._get_agent_available_resources(agent_id)
+        
+        if available_e < energy:
+            return False
+        
+        # Move from available to locked
+        agent["E_available"] -= energy
+        agent["E_locked"] += energy
+        return True
+    
+    def _unlock_resources(self, agent_id: int, energy: int) -> None:
+        """Unlock resources when a proposal is rejected or expires."""
+        agent = self.agents[agent_id]
+        agent["E_locked"] = max(0, agent["E_locked"] - energy)
+        agent["E_available"] += energy
 
     def _regenerate_npc_thresholds(self) -> None:
         """
@@ -426,10 +523,10 @@ class NexusRlEnvironment(Environment):
         self._initialize_agents()
         
         # Reset utilities tracking
-        self.previous_utilities = {
-            i: calculate_utility(self.agents[i]["E"], self.agents[i]["C"])
-            for i in range(self.num_agents)
-        }
+        self.previous_utilities = {}
+        for i in range(self.num_agents):
+            total_e, total_c = self._get_agent_total_resources(i)
+            self.previous_utilities[i] = calculate_utility(total_e, total_c)
         
         # Generate new NPC thresholds for episode diversity
         self._regenerate_npc_thresholds()
@@ -441,19 +538,17 @@ class NexusRlEnvironment(Environment):
         
         # Return observation for Agent 0
         agent_id = 0
+        total_e, total_c = self._get_agent_total_resources(agent_id)
         return NexusRlObservation(
             agent_id=agent_id,
             inventory=self.agents[agent_id].copy(),
             public_ledger=self.public_ledger.copy(),
             social_lattice=self.trust_scores[agent_id].copy(),
             environment_status=self.current_shock,
-            utility=calculate_utility(
-                self.agents[agent_id]["E"],
-                self.agents[agent_id]["C"]
-            ),
+            utility=calculate_utility(total_e, total_c),
             done=False,
             reward=0.0,
-            metadata={"reset_count": self._reset_count}
+            metadata={"reset_count": self._reset_count, "avg_trust_in_me": 0.5}
         )
     def step(self, action: NexusRlAction) -> NexusRlObservation:  # type: ignore[override]
         """
@@ -503,6 +598,12 @@ class NexusRlEnvironment(Environment):
                 expired_proposals.append(proposal_key)
         
         for key in expired_proposals:
+            # INVENTORY LOCKING: Unlock resources when proposal expires
+            proposal_data = self.active_proposals[key]
+            action = proposal_data.get("action")
+            if action and action.action_type == "PROPOSE":
+                proposer_id = int(key.split("->")[0])
+                self._unlock_resources(proposer_id, action.offer_E)
             del self.active_proposals[key]
         
         # ============================================================
@@ -530,16 +631,21 @@ class NexusRlEnvironment(Environment):
         # ============================================================
         if not validation_errors and action.action_type == "PROPOSE":
             proposal_key = f"{agent_0_id}->{action.target_id}"
-            self.active_proposals[proposal_key] = {
-                "action": action,
-                "created_step": self._state.step_count
-            }
+            # INVENTORY LOCKING: Lock the proposed energy to prevent double-spending
+            if self._lock_resources(agent_0_id, action.offer_E, 0):
+                self.active_proposals[proposal_key] = {
+                    "action": action,
+                    "created_step": self._state.step_count
+                }
+            else:
+                # Insufficient available energy, add to validation errors
+                validation_errors.append(f"Insufficient available energy to lock {action.offer_E}")
         
         # ============================================================
         # 6. Generate NPC Reactions
         # ============================================================
         npc_actions: Dict[int, NexusRlAction] = {}
-        for npc_id in [1, 2, 3]:
+        for npc_id in range(1, self.num_agents):
             npc_action = self._generate_npc_action(npc_id)
             npc_actions[npc_id] = npc_action
             
@@ -557,8 +663,21 @@ class NexusRlEnvironment(Environment):
         all_actions: Dict[int, NexusRlAction] = {agent_0_id: action, **npc_actions}
         settled_trades: List[Tuple[int, int, Dict]] = []
         
-        for proposer_id in all_actions:
-            proposer_action = all_actions[proposer_id]
+        # EXECUTION FAIRNESS: Randomize action processing order after warmup
+        # This prevents first-mover advantage in the proposal buffer
+        if self.config.SHUFFLE_ACTION_ORDER_AFTER_WARMUP and self._reset_count > self.config.WARMUP_EPISODES:
+            # Shuffle agent IDs after warmup period
+            agent_order = list(range(self.num_agents))
+            random.shuffle(agent_order)
+        else:
+            # Fixed order during warmup
+            agent_order = list(range(self.num_agents))
+        
+        # Process trades in (possibly randomized) order
+        for proposer_id in agent_order:
+            proposer_action = all_actions.get(proposer_id)
+            if not proposer_action:
+                continue
             
             if proposer_action.action_type == "PROPOSE":
                 target_id = proposer_action.target_id
@@ -662,36 +781,22 @@ class NexusRlEnvironment(Environment):
             self.agents[agent_0_id]["C"]
         )
         
-        # Delta utility: primary reward component
+        # Calculate reward: ΔU only (pure utility incentive)
+        # Trust exists in observation but NOT in reward to prevent wash-trading
         delta_utility = current_utility - self.previous_utilities[agent_0_id]
+        reward = self.config.REWARD_WEIGHT_UTILITY * delta_utility
         
-        # Calculate average trust in Agent 0 (from others)
+        # Calculate trust metrics for observation (instrumental, not terminal)
         trust_in_me = [
             self.trust_scores[i][agent_0_id]
-            for i in [1, 2, 3]
+            for i in range(1, self.num_agents)
         ]
-        avg_trust_in_me = np.mean(trust_in_me)
-        previous_avg_trust = self.previous_utilities.get("avg_trust_in_me", 0.5)
-        delta_trust_in_me = avg_trust_in_me - (previous_avg_trust or 0.5)
-        
-        # New reward formula: incentivize both utility and reputation
-        # Using weights from config for easy tuning
-        # 
-        # CRITICAL ISSUES IDENTIFIED (see comments in code):
-        # 1. Trust washing: Agent can achieve high trust, then defect end-of-episode
-        # 2. Utility-based reward only: Makes Agent 0 exploit other agents' desperation
-        # 3. Missing termination: Need episode end condition (max steps, failure, success)
-        # 4. Ledger growth: Need pagination/summarization for long episodes
-        # 
-        # TODO: Address these in next design iteration (Phase 2)
-        
-        reward = (self.config.REWARD_WEIGHT_UTILITY * delta_utility) + (self.config.REWARD_WEIGHT_TRUST * delta_trust_in_me)
+        avg_trust_in_me = np.mean(trust_in_me) if trust_in_me else 0.5
         
         # Update previous utilities for next step
         self.previous_utilities[agent_0_id] = current_utility
-        self.previous_utilities["avg_trust_in_me"] = avg_trust_in_me
         
-        for npc_id in [1, 2, 3]:
+        for npc_id in range(1, self.num_agents):
             self.previous_utilities[npc_id] = calculate_utility(
                 self.agents[npc_id]["E"],
                 self.agents[npc_id]["C"]
@@ -716,7 +821,6 @@ class NexusRlEnvironment(Environment):
                 "validation_errors": validation_errors,
                 "avg_trust_in_me": avg_trust_in_me,
                 "delta_utility": delta_utility,
-                "delta_trust": delta_trust_in_me,
             }
         )
         
@@ -818,8 +922,11 @@ class NexusRlEnvironment(Environment):
         """
         Execute a trade between two agents.
 
-        Validates that both agents have sufficient resources, then transfers.
-        Includes logging for settlement success/failure.
+        Uses inventory locking system:
+        - On ACCEPT: Transfer from proposer's LOCKED to target's AVAILABLE
+        - On REJECT/EXPIRE: Move locked resources back to available
+        
+        This prevents double-spending by reserving resources when proposals are made.
 
         Args:
             proposer_id: Agent making the proposal
@@ -832,69 +939,122 @@ class NexusRlEnvironment(Environment):
         offer_E = proposal.offer_E
         request_C = proposal.request_C
         
-        # Validate resources
-        can_proposer_afford = self.agents[proposer_id]["E"] >= offer_E
-        can_target_afford = self.agents[target_id]["C"] >= request_C
+        # Get proposal key for cleanup
+        proposal_key = f"{proposer_id}->{target_id}"
         
-        fulfilled = can_proposer_afford and can_target_afford
+        # Validate: Can target afford to give compute?
+        target_available_c = self.agents[target_id].get("C_available", 0)
+        can_target_afford = target_available_c >= request_C
+        
+        # Can proposer fulfill? (Energy should already be locked)
+        proposer_locked_e = self.agents[proposer_id].get("E_locked", 0)
+        can_proposer_fulfill = proposer_locked_e >= offer_E
+        
+        fulfilled = can_proposer_fulfill and can_target_afford
         
         if fulfilled:
-            # SYNERGISTIC TRADE: Cooperation creates value
-            # Proposer (giver of E) receives bonus on what they get back
-            # This incentivizes fair trades over exploitation
-            compute_bonus = int(request_C * self.config.SYNERGY_BONUS_PCT)
+            # RESOURCE CONSERVATION: Strict zero-sum trade
+            # Locked energy transfers from proposer to target
+            # Available compute transfers from target to proposer
             
-            # Transfer resources with synergy bonus
-            self.agents[proposer_id]["E"] -= offer_E
-            self.agents[proposer_id]["C"] += request_C + compute_bonus  # Bonus for proposing/cooperating
+            self.agents[proposer_id]["E_locked"] -= offer_E
+            self.agents[proposer_id]["C_available"] += request_C
             
-            self.agents[target_id]["E"] += offer_E
-            self.agents[target_id]["C"] -= request_C  # They give as requested (synergy doesn't cost them)
+            self.agents[target_id]["E_available"] += offer_E
+            self.agents[target_id]["C_available"] -= request_C
+        else:
+            # Trade failed: Unlock proposer's reserved energy
+            if proposal_key in self.active_proposals:
+                self._unlock_resources(proposer_id, offer_E)
         
-        # Clean up proposal from buffer (always, whether fulfilled or not)
-        proposal_key = f"{proposer_id}->{target_id}"
+        # Clean up proposal from buffer (always)
         if proposal_key in self.active_proposals:
             del self.active_proposals[proposal_key]
         
         # Return trade record
-        if fulfilled:
-            return {
-                "offer_E": offer_E,
-                "request_C": request_C,
-                "fulfilled": fulfilled,
-                "synergy_bonus_C": compute_bonus
-            }
-        else:
-            return {
-                "offer_E": offer_E,
-                "request_C": request_C,
-                "fulfilled": fulfilled,
+        return {
+            "offer_E": offer_E,
+            "request_C": request_C,
+            "fulfilled": fulfilled,
                 "synergy_bonus_C": 0  # No bonus if trade fails
             }
 
     def _apply_environmental_shock(self, shock_type: str) -> None:
         """
-        Apply environmental shock effects to all agents.
+        Apply environmental shock effects with ASYMMETRIC impact.
         
-        Shocks are deterministic (all agents affected equally).
-        This prevents Agent 0 from learning to exploit one agent's weakness.
+        ASYMMETRIC SHOCKS (Force Renegotiation):
+        - Rich agents (high resource) lose more than poor agents
+        - This flips power dynamics and forces social realignment
+        - Prevents the 10:1 ratio from being permanently stable
         
         Args:
             shock_type: One of "SOLAR_FLARE" or "GRID_FAILURE"
         """
         if shock_type == "SOLAR_FLARE":
-            # All agents lose SHOCK_ENERGY_LOSS_PCT of current Energy
+            # SOLAR_FLARE: Energy loss (asymmetric based on wealth)
+            # Calculate energy wealth across all agents
+            total_energy = sum(
+                self.agents[i].get("E_available", 0) + self.agents[i].get("E_locked", 0)
+                for i in range(self.num_agents)
+            )
+            avg_energy = total_energy / self.num_agents if self.num_agents > 0 else 1
+            
             loss_pct = self.config.SHOCK_ENERGY_LOSS_PCT
+            
             for agent_id in range(self.num_agents):
-                energy_loss = int(self.agents[agent_id]["E"] * loss_pct)
-                self.agents[agent_id]["E"] = max(0, self.agents[agent_id]["E"] - energy_loss)
+                agent = self.agents[agent_id]
+                agent_energy = agent.get("E_available", 0) + agent.get("E_locked", 0)
+                
+                # ASYMMETRIC: Rich agents lose more (1.5x multiplier if above average)
+                wealth_ratio = agent_energy / avg_energy if avg_energy > 0 else 1.0
+                asymmetric_loss_pct = loss_pct * (1.0 + max(0, wealth_ratio - 1.0) * 0.5)
+                
+                energy_loss = int(agent_energy * min(asymmetric_loss_pct, 0.5))  # Cap at 50%
+                total_to_lose = energy_loss
+                
+                # Remove from available first, then locked
+                available_e = agent.get("E_available", 0)
+                locked_e = agent.get("E_locked", 0)
+                
+                if total_to_lose <= available_e:
+                    agent["E_available"] = max(0, available_e - total_to_lose)
+                else:
+                    agent["E_available"] = 0
+                    remaining = total_to_lose - available_e
+                    agent["E_locked"] = max(0, locked_e - remaining)
         
         elif shock_type == "GRID_FAILURE":
-            # All agents lose SHOCK_COMPUTE_LOSS_PCT of current Compute
+            # GRID_FAILURE: Compute loss (asymmetric based on wealth)
+            total_compute = sum(
+                self.agents[i].get("C_available", 0) + self.agents[i].get("C_locked", 0)
+                for i in range(self.num_agents)
+            )
+            avg_compute = total_compute / self.num_agents if self.num_agents > 0 else 1
+            
             loss_pct = self.config.SHOCK_COMPUTE_LOSS_PCT
+            
             for agent_id in range(self.num_agents):
-                compute_loss = int(self.agents[agent_id]["C"] * loss_pct)
-                self.agents[agent_id]["C"] = max(0, self.agents[agent_id]["C"] - compute_loss)
+                agent = self.agents[agent_id]
+                agent_compute = agent.get("C_available", 0) + agent.get("C_locked", 0)
+                
+                # ASYMMETRIC: Rich agents lose more
+                wealth_ratio = agent_compute / avg_compute if avg_compute > 0 else 1.0
+                asymmetric_loss_pct = loss_pct * (1.0 + max(0, wealth_ratio - 1.0) * 0.5)
+                
+                compute_loss = int(agent_compute * min(asymmetric_loss_pct, 0.5))
+                total_to_lose = compute_loss
+                
+                # Remove from available first, then locked
+                available_c = agent.get("C_available", 0)
+                locked_c = agent.get("C_locked", 0)
+                
+                if total_to_lose <= available_c:
+                    agent["C_available"] = max(0, available_c - total_to_lose)
+                else:
+                    agent["C_available"] = 0
+                    remaining = total_to_lose - available_c
+                    agent["C_locked"] = max(0, locked_c - remaining)
 
     def _apply_resource_decay(self) -> None:
         """
