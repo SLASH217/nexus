@@ -199,30 +199,62 @@ class ENVConfig:
     SHOCK_COMPUTE_LOSS_PCT: float = 0.20  # GRID_FAILURE: all lose 20% Compute
     
     # ========== REWARD FORMULA ==========
-    # Agent 0's reward: R = ΔU only
+    # Agent 0's reward: Social Welfare = ΔU_agent_0 + λ * Σ(ΔU_other_agents)
     #
-    # CRITICAL DESIGN DECISION: Separation of Reward and Trust
-    # ─────────────────────────────────────────────────────────
-    # Why pure ΔU reward?
-    # 1. Direct incentive alignment: Agent learns that resource gains = good
-    # 2. Prevents wash-trading: Agents can't game the system with tiny trades
-    # 3. Scalable to many agents: No need to weight trust per peer
+    # CRITICAL DESIGN DECISION: Incentivizing "Calculated Interdependence"
+    # ──────────────────────────────────────────────────────────────────────
+    # 
+    # PRINCIPLE: Agent 0 learns that system-wide welfare = personal success.
+    # If other agents go bankrupt (U→0), Agent 0 eventually has no trading partners.
+    # 
+    # Formula: R = ΔU_agent_0 + λ * [ΔU_agent_1 + ΔU_agent_2 + ΔU_agent_3]
+    # 
+    # Where:
+    #   λ (ALTRUISM_COEFFICIENT): Weight on other agents' welfare
+    #   Default λ=0.5: Other agents' welfare counts half as much as own
+    #   λ=0.0: Pure selfishness (Agent 0 only cares about themselves)
+    #   λ=1.0: Equal weighting (Agent 0 cares about all equally)
     #
-    # Why trust in observation, not reward?
-    # 1. Trust is instrumental (enables future trades), not terminal
-    # 2. Learning effect: Agent discovers trust → better proposals → higher ΔU
-    # 3. Avoids specification gaming: Can't directly optimize trust score
-    # 4. Matches real-world incentives: Reputation pays off through market dynamics
+    # EXAMPLE SCENARIO:
+    # Step 1: Agent 0 extracts unfairly from Bully, gaining +20U
+    #   Bully loses -10U
+    #   Reward: +20 + 0.5*(-10) = +15  ✓ (still good, but penalized for harming others)
     #
-    # Example:
-    # Step 5: Fair trade accepted
-    #   ΔU = +10  → reward = +10 ✓
-    #   ΔTrust = +0.05  → NOT rewarded (trust is in obs only)
+    # Step 100: Cooperative equilibrium
+    #   Agent 0 gains +5U, Bully gains +3U, Altruist gains +4U, TFT gains +3U
+    #   Reward: +5 + 0.5*(3+4+3) = +5 + 5 = +10  ✓ (beat the exploit!)
     #
-    # Step 10: Agent learns that high trust enabled more favorable proposals
-    #   The trust was USEFUL indirectly (via better trades) but NOT DIRECTLY rewarded
-    REWARD_WEIGHT_UTILITY: float = 1.0  # Pure utility reward (ΔU only)
+    # LEARNING EFFECT:
+    # Agent 0 discovers that:
+    # 1. Bullying works short-term but collapses the system
+    # 2. Fair deals enable sustainable cooperation
+    # 3. Long-term gains require maintaining system health
+    # 4. The Pareto frontier (all agents at high U) is the actual optimum
+    #
+    # Why trust STILL in observation only?
+    # - Trust enables cooperation (instrumental effect)
+    # - System health (other agents' utilities) is the terminal signal
+    # - This prevents gaming: can't do fake trades to boost trust
+    #
+    REWARD_WEIGHT_UTILITY: float = 1.0  # Agent 0's own utility (ΔU_agent_0)
     REWARD_WEIGHT_TRUST: float = 0.0    # Trust NOT rewarded (in observation space only)
+    
+    # ========== SOCIAL WELFARE COEFFICIENT ==========
+    # Weight on other agents' utility changes
+    # λ in: R = ΔU_agent_0 + λ * Σ(ΔU_other_agents)
+    #
+    # CRITICAL: This parameter determines learning incentives
+    #
+    # Values:
+    #   0.0 = Pure selfishness (only Agent 0's utility matters)
+    #   0.5 = Mild altruism (default - other agents' welfare counts half)
+    #   1.0 = Perfect altruism (all agents equally important)
+    #
+    # Tuning guide:
+    #   - Use 0.5 for baseline (forces system-wide thinking without over-softening)
+    #   - Lower if Agent 0 isn't learning to trade
+    #   - Higher if Agent 0 is exploiting too much in early episodes
+    ALTRUISM_COEFFICIENT: float = 0.5  # Weight on other agents' welfare
     # ========== TRUST UPDATE PARAMETERS ==========
     # Alpha in trust update: T_new = alpha * target + (1-alpha) * T_old
     # 
@@ -832,21 +864,39 @@ class NexusRlEnvironment(Environment):
         # 9. Calculate Utilities and Reward
         # ============================================================
         # CRITICAL DESIGN: Reward signal is PURELY utility-based (ΔU)
-        # Trust scores exist ONLY in the observation space (instrumental variable)
-        # NOT in the reward function (terminal variable)
+        # REWARD CALCULATION: Social Welfare Function
+        # ═════════════════════════════════════════════════════════════════
+        # R = REWARD_WEIGHT_UTILITY * ΔU_agent_0 + ALTRUISM_COEFFICIENT * Σ(ΔU_other)
         #
-        # Why this separation?
-        # - Reward only ΔU: Encourages actual resource gains, not gaming the system
-        # - Trust in obs: Agents learn that trust ENABLES future trades (indirect effect)
-        # - Prevents wash-trading: Can't do 1E ↔ 1E trades to boost trust for reward
-        # - Correct RL incentive: Reward the outcome (utility), not the intermediate state
+        # This forces Agent 0 to learn:
+        # 1. Selfishness: Short-term gains but collapses trading ecosystem
+        # 2. Fair play: Long-term stability and mutual gains
+        # 3. System thinking: Everyone's welfare matters to your own welfare
+        # ═════════════════════════════════════════════════════════════════
+        
+        # Calculate Agent 0's utility change
         current_utility = calculate_utility(
             self.agents[agent_0_id]["E"],
             self.agents[agent_0_id]["C"]
         )
+        delta_utility_agent_0 = current_utility - self.previous_utilities[agent_0_id]
         
-        delta_utility = current_utility - self.previous_utilities[agent_0_id]
-        reward = self.config.REWARD_WEIGHT_UTILITY * delta_utility
+        # Calculate total utility change for other agents (system welfare)
+        total_delta_utility_others = 0.0
+        for other_id in range(self.num_agents):
+            if other_id != agent_0_id:
+                other_utility = calculate_utility(
+                    self.agents[other_id]["E"],
+                    self.agents[other_id]["C"]
+                )
+                delta_utility_other = other_utility - self.previous_utilities[other_id]
+                total_delta_utility_others += delta_utility_other
+        
+        # Social Welfare Reward Function
+        # R = Agent 0's gain + λ * (System welfare gain)
+        agent_0_reward_component = self.config.REWARD_WEIGHT_UTILITY * delta_utility_agent_0
+        system_welfare_component = self.config.ALTRUISM_COEFFICIENT * total_delta_utility_others
+        reward = agent_0_reward_component + system_welfare_component
         
         # Calculate trust metrics for observation (instrumental, not terminal)
         trust_in_me = [
@@ -863,6 +913,15 @@ class NexusRlEnvironment(Environment):
                 self.agents[npc_id]["E"],
                 self.agents[npc_id]["C"]
             )
+        
+        # For logging/debugging: Show reward components
+        reward_info = {
+            "reward_total": reward,
+            "reward_agent_0": agent_0_reward_component,
+            "reward_system_welfare": system_welfare_component,
+            "delta_utility_agent_0": delta_utility_agent_0,
+            "delta_utility_others_total": total_delta_utility_others,
+        }
         
         # ============================================================
         # 10. Generate Observation for Agent 0
@@ -882,7 +941,14 @@ class NexusRlEnvironment(Environment):
                 "trades_settled": len(settled_trades),
                 "validation_errors": validation_errors,
                 "avg_trust_in_me": avg_trust_in_me,
-                "delta_utility": delta_utility,
+                "delta_utility": delta_utility_agent_0,
+                "reward_breakdown": {
+                    "total": reward,
+                    "agent_0_component": agent_0_reward_component,
+                    "system_welfare_component": system_welfare_component,
+                    "delta_utility_agent_0": delta_utility_agent_0,
+                    "delta_utility_others_sum": total_delta_utility_others,
+                },
             }
         )
         
