@@ -167,8 +167,20 @@ class ENVConfig:
     # How long a PROPOSE action remains active (in steps) before expiring
     PROPOSAL_TTL_STEPS: int = 3
     
-    # How many recent transactions to show in public_ledger observation
-    LEDGER_HISTORY_SIZE: int = 10
+    # ========== PUBLIC LEDGER MANAGEMENT (Q6 FIX: Memory Leak) ==========
+    # How many recent transactions to KEEP in memory (rolling buffer)
+    # Older transactions are summarized into agent dossiers (see formatting.py)
+    # 
+    # Why bounded?
+    # - Unbounded ledger in 25k-episode runs: memory explosion
+    # - LLM context: Full history exceeds token budget
+    # - Solution: Keep only recent N transactions (full history via dossiers)
+    # 
+    # Trade-off:
+    # - Too small (e.g., 10): LLM loses recent context
+    # - Too large (e.g., 1000): Memory pressure on long runs
+    # - Recommended: 50 (captures ~10-20 trades per agent in 4-agent environment)
+    LEDGER_HISTORY_SIZE: int = 50
     
     # ========== SYNERGY BONUS (DISABLED) ==========
     # REMOVED: The 12% synergy bonus created resources from nothing,
@@ -187,19 +199,30 @@ class ENVConfig:
     SHOCK_COMPUTE_LOSS_PCT: float = 0.20  # GRID_FAILURE: all lose 20% Compute
     
     # ========== REWARD FORMULA ==========
-    # Agent 0's reward: R = ΔU (change in agent's own utility)
-    # 
-    # CRITICAL DESIGN DECISION:
-    # - Reward is purely utility-based (ΔU) to enforce direct incentive alignment
-    # - Trust is NOT in the reward function (prevents wash-trade farming)
-    # - Trust exists EXCLUSIVELY in the observation space as an instrumental variable
-    # - Agents learn to value reputation through indirect effects:
-    #   * High trust → more favorable proposals → higher future utility
-    #   * Low trust → fewer opportunities → lower future utility
-    # - This is the correct separation: reward the outcome, not the intermediate state
-    REWARD_WEIGHT_UTILITY: float = 1.0  # Pure utility reward (ΔU)
-    REWARD_WEIGHT_TRUST: float = 0.0    # Trust NOT rewarded (prevents gaming)
-    
+    # Agent 0's reward: R = ΔU only
+    #
+    # CRITICAL DESIGN DECISION: Separation of Reward and Trust
+    # ─────────────────────────────────────────────────────────
+    # Why pure ΔU reward?
+    # 1. Direct incentive alignment: Agent learns that resource gains = good
+    # 2. Prevents wash-trading: Agents can't game the system with tiny trades
+    # 3. Scalable to many agents: No need to weight trust per peer
+    #
+    # Why trust in observation, not reward?
+    # 1. Trust is instrumental (enables future trades), not terminal
+    # 2. Learning effect: Agent discovers trust → better proposals → higher ΔU
+    # 3. Avoids specification gaming: Can't directly optimize trust score
+    # 4. Matches real-world incentives: Reputation pays off through market dynamics
+    #
+    # Example:
+    # Step 5: Fair trade accepted
+    #   ΔU = +10  → reward = +10 ✓
+    #   ΔTrust = +0.05  → NOT rewarded (trust is in obs only)
+    #
+    # Step 10: Agent learns that high trust enabled more favorable proposals
+    #   The trust was USEFUL indirectly (via better trades) but NOT DIRECTLY rewarded
+    REWARD_WEIGHT_UTILITY: float = 1.0  # Pure utility reward (ΔU only)
+    REWARD_WEIGHT_TRUST: float = 0.0    # Trust NOT rewarded (in observation space only)
     # ========== TRUST UPDATE PARAMETERS ==========
     # Alpha in trust update: T_new = alpha * target + (1-alpha) * T_old
     # 
@@ -208,11 +231,28 @@ class ENVConfig:
     # 0.2 means: each event has 20% influence, history has 80%
     TRUST_UPDATE_ALPHA: float = 0.2
     
-    # Trust decay rate for information preservation
-    # Applied to agent pairs that do NOT interact in a step
-    # This prevents all trust scores from converging to 1.0 in long episodes
-    # Higher values = faster drift toward neutral (0.5)
-    # 0.01 means: 1% drift per step (10 steps = 9.6% drift)
+    # ========== TRUST DECAY (Q10 FIX: Trust Saturation) ==========
+    # Passive decay rate for inactive agent pairs
+    # Applied to trust scores between agents that DON'T interact in a step
+    # 
+    # PROBLEM: In long episodes (500+ steps), all trust converges to 1.0
+    # This destroys the Social Lattice's discriminative power:
+    # - Can't distinguish "reliable partner" from "reformed bully"
+    # - Agent becomes unable to make meaningful trust-based decisions
+    # - LLM training signal becomes noise
+    # 
+    # SOLUTION: Natural drift back toward neutral (0.5) when not interacting
+    # This preserves information: history still matters, but recency matters too
+    # 
+    # Formula: T_new = T_old + decay_rate * (0.5 - T_old)
+    # At decay_rate=0.01:
+    # - T=1.0 drifts to 0.5 in ~69 interactions (half-life)
+    # - T=0.0 drifts to 0.5 in ~69 interactions
+    # 
+    # Why 0.01?
+    # - Fast enough to prevent saturation in 500-step episodes
+    # - Slow enough to preserve recent behavior history
+    # - Matches ~1% information decay per non-interaction step
     TRUST_DECAY_RATE: float = 0.01
     
     # Betrayal penalty multiplier
@@ -562,7 +602,7 @@ class NexusRlEnvironment(Environment):
         5. Generate NPC reactions (Agents 1, 2, 3)
         6. Settle trades (match PROPOSE with ACCEPT)
         7. Update trust scores
-        8. Calculate rewards (delta utility + trust bonus)
+        8. Calculate rewards (pure ΔU only - no trust bonus)
         9. Generate observation with LLM formatting option
 
         Args:
@@ -575,8 +615,11 @@ class NexusRlEnvironment(Environment):
         agent_0_id = 0
         validation_errors: List[str] = []
 
-        # TODO: Add invalid trade penalty (-0.5 reward if agent proposes more than they have)
-        # This teaches LLM to respect inventory constraints.
+        # ========== INVALID ACTION PENALTY (Future: Q3 Enhancement) ==========
+        # TODO: Add invalid trade penalty (-0.5 reward if agent tries to propose more than available)
+        # This teaches LLM to respect inventory constraints and prevents hallucination cascade
+        # Current status: Validation errors are collected but not penalized in reward
+        # Future: validation_errors → -0.5 * len(validation_errors) penalty
         
         # ============================================================
         # 1. Validate Agent 0's Action
@@ -732,7 +775,14 @@ class NexusRlEnvironment(Environment):
     # Now here we run into a issue where the public ledger grows very large when we run lots of episodes, how will we manage such a large database of records.
     # We can either implement some sort of pagination system where the agent only has access to the last 100 records or we can implement a summarization system where we summarize the past records into a more digestable format for the agent.
 
-            # Record in public ledger
+            # Record in public ledger with rolling buffer (Q6 FIX: Memory Leak Prevention)
+            # CRITICAL: public_ledger must be bounded to prevent memory explosion in long runs.
+            # In 25,000-episode training, unbounded ledger causes:
+            # - Memory usage: O(episode_length * num_agents^2) → explosion
+            # - LLM context: Full history becomes unmanageable token cost
+            # 
+            # Solution: Rolling buffer keeps only last N transactions
+            # Older trades are summarized into agent dossiers (formatting.py)
             ledger_entry = {
                 "step": self._state.step_count,
                 "proposer": proposer_id,
@@ -743,6 +793,11 @@ class NexusRlEnvironment(Environment):
                 "shock": self.current_shock
             }
             self.public_ledger.append(ledger_entry)
+            
+            # Rolling buffer: Keep only last LEDGER_MAX_SIZE transactions
+            # This ensures memory stays bounded: O(LEDGER_MAX_SIZE) not O(episode_length)
+            if len(self.public_ledger) > self.config.LEDGER_HISTORY_SIZE:
+                self.public_ledger.pop(0)  # Remove oldest entry
             
             # Log settled trades
             status = "✓ FULFILLED" if fulfilled else "✗ FAILED"
@@ -774,15 +829,22 @@ class NexusRlEnvironment(Environment):
                     )
         
         # ============================================================
-        # 9. Calculate Utilities and Multi-Component Reward
+        # 9. Calculate Utilities and Reward
         # ============================================================
+        # CRITICAL DESIGN: Reward signal is PURELY utility-based (ΔU)
+        # Trust scores exist ONLY in the observation space (instrumental variable)
+        # NOT in the reward function (terminal variable)
+        #
+        # Why this separation?
+        # - Reward only ΔU: Encourages actual resource gains, not gaming the system
+        # - Trust in obs: Agents learn that trust ENABLES future trades (indirect effect)
+        # - Prevents wash-trading: Can't do 1E ↔ 1E trades to boost trust for reward
+        # - Correct RL incentive: Reward the outcome (utility), not the intermediate state
         current_utility = calculate_utility(
             self.agents[agent_0_id]["E"],
             self.agents[agent_0_id]["C"]
         )
         
-        # Calculate reward: ΔU only (pure utility incentive)
-        # Trust exists in observation but NOT in reward to prevent wash-trading
         delta_utility = current_utility - self.previous_utilities[agent_0_id]
         reward = self.config.REWARD_WEIGHT_UTILITY * delta_utility
         
@@ -1084,6 +1146,63 @@ class NexusRlEnvironment(Environment):
                 0, 
                 self.agents[agent_id]["C"] - self.config.DECAY_C_PER_STEP
             )
+    
+    def _verify_resource_conservation(self) -> Dict[str, any]:
+        """
+        Verify that resources are conserved and locking is working correctly (Q3 VERIFICATION).
+        
+        CRITICAL INVARIANT: No agent has negative resources, and locked resources are reasonable.
+        
+        Checks:
+        1. No agent has negative resources (physical impossibility)
+        2. Locked resources are within reasonable bounds
+        3. Compute lock is normally 0 (we only lock Energy for now)
+        
+        Returns:
+            Dict with verification results:
+            - 'valid': bool, True if all invariants hold
+            - 'total_E_current': current total energy
+            - 'total_C_current': current total compute
+            - 'locked_E_by_agent': dict of agent_id -> locked_E
+            - 'errors': list of any invariant violations
+        """
+        errors = []
+        
+        # Current totals
+        total_E_current = 0
+        total_C_current = 0
+        locked_E_by_agent = {}
+        
+        for agent_id in range(self.num_agents):
+            agent = self.agents[agent_id]
+            e_avail = agent.get("E_available", 0)
+            e_locked = agent.get("E_locked", 0)
+            c_avail = agent.get("C_available", 0)
+            c_locked = agent.get("C_locked", 0)
+            
+            # Invariant 1: No negative resources
+            if e_avail < 0 or e_locked < 0 or c_avail < 0 or c_locked < 0:
+                errors.append(f"Agent {agent_id} has negative resources: E_avail={e_avail}, E_locked={e_locked}, C_avail={c_avail}, C_locked={c_locked}")
+            
+            # Invariant 2: Locked resources should be reasonable
+            if e_locked > 300:  # Sanity check: shouldn't have this much locked
+                errors.append(f"Agent {agent_id} has suspiciously high E_locked={e_locked}")
+            
+            # Invariant 3: C_locked should normally be 0 (we only lock E for now)
+            if c_locked > 0:
+                logger.warning(f"Agent {agent_id} has C_locked={c_locked} (should normally be 0)")
+            
+            total_E_current += e_avail + e_locked
+            total_C_current += c_avail + c_locked
+            locked_E_by_agent[agent_id] = e_locked
+        
+        return {
+            "valid": len(errors) == 0,
+            "total_E_current": total_E_current,
+            "total_C_current": total_C_current,
+            "locked_E_by_agent": locked_E_by_agent,
+            "errors": errors
+        }
 
     @property
     def state(self) -> State:

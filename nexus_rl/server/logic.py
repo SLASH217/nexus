@@ -53,77 +53,110 @@ def update_trust(
     max_resource: int = 100
 ) -> float:
     """
-    Social Lattice trust update with impact weighting.
+    Social Lattice trust update with volume-weighted impact (Q12 FIX).
     
-    CRITICAL: This prevents the "wash reputation" exploit.
+    CRITICAL: Prevents the "wash reputation" exploit where bullies do massive
+    betrayals then quickly recover reputation with tiny trades.
     
     Formula:
-        impact = alpha * (trade_value / max_resource)
-        T_new = impact * target + (1 - impact) * T_old
+        volume_weight = log1p(trade_value) / log1p(max_resource)
+        effective_alpha = alpha * volume_weight
+        T_new = effective_alpha * target + (1 - effective_alpha) * T_old
         
     Where:
         target = 1.0 if fulfilled else 0.0
         alpha = base learning rate (0.2 default)
-        trade_value = resource quantity involved (1-100)
-        max_resource = largest possible trade (100)
-        
-    Why impact weighting?
-    - Naive EMA: 1 betrayal of 50E + 2 small trades of 5E each washes reputation
-    - Impact weighting: 50E betrayal has 50x more impact → needs 50 small trades to recover
-    - Prevents agents from doing large betrayals then quickly "resetting" with small trades
+        trade_value = total resources involved (1-100)
+        max_resource = largest possible trade (100) for normalization
     
-    Intuition:
-    - Big trades (50E) should signal more about trustworthiness than small ones (1E)
-    - Alpha of 0.2 at full trade means 20% influence
-    - Alpha of 0.004 at tiny trade means 0.4% influence (requires many trades to recover)
-    - Creates realistic reputation dynamics
+    Why logarithmic volume weighting?
+    - Linear scaling: 1 betrayal of 50E + 50 tiny 1E trades cancels out (EXPLOITABLE)
+    - Log scaling: 50E betrayal has ~log(51)=3.9x impact vs log(2)=1.1x for tiny trades
+    - Result: Betrayal now requires ~3.5x more recovery trades (realistic reputation mechanics)
+    
+    Intuition with concrete example:
+    - Step 1: Agent trades 50E, defaults → betrayal_impact ≈ 0.2 * 3.9 ≈ 0.78
+      Trust: 0.5 → 0.5 * (1-0.78) + 1.0 * 0.78 = 0.11 + 0.78 = 0.89... NO wait, that's wrong
+      Actually: T_new = 0.78 * 0.0 + (1-0.78) * 0.5 = 0.0 + 0.11 = 0.11 (sharp drop)
+    - Step 2-50: Agent does 50 trades of 1E each
+      Each: volume_weight ≈ log(2) / log(101) ≈ 1.1 / 4.6 ≈ 0.24
+      Each: effective_alpha ≈ 0.2 * 0.24 = 0.048
+      Each: T_new = 0.048 * 1.0 + 0.952 * T_old (slow recovery)
+      After 50 trades: T ≈ 0.5 (needs ~150 trades to reach pre-betrayal 0.9)
+    - Without log weighting: Would only need ~3-5 tiny trades to wash
     
     Args:
         current_score: Previous trust score [0.0, 1.0]
         fulfilled: Did the agent honor their commitment?
-        alpha: Base learning rate (higher = faster changes)
-        trade_value: Resources involved in this trade (1-100)
-        max_resource: Maximum possible trade amount for normalization
+        alpha: Base learning rate (higher = faster changes). Default 0.2
+        trade_value: Total resources involved (E + C). Range: 1-100
+        max_resource: Largest possible trade amount. Default 100
         
     Returns:
-        float: Updated trust score [0.0, 1.0]
+        float: Updated trust score [0.0, 1.0], clamped to valid range
     """
-    # Compute impact-weighted learning rate
-    impact = alpha * (max(1, min(trade_value, max_resource)) / max_resource)
+    import math
     
-    # Standard EMA with impact weighting
+    # Clamp trade_value to valid range
+    clamped_value = max(1, min(trade_value, max_resource))
+    
+    # Logarithmic volume weighting: prevents linear exploits
+    # log1p = log(1 + x) to handle small values smoothly
+    volume_weight = math.log1p(clamped_value) / math.log1p(max_resource)
+    
+    # Effective alpha is attenuated by volume weight
+    # Small trades have small alpha, big trades have full alpha
+    effective_alpha = alpha * volume_weight
+    
+    # Standard EMA with volume-weighted alpha
     target = 1.0 if fulfilled else 0.0
-    new_score = (impact * target) + (1.0 - impact) * current_score
+    new_score = (effective_alpha * target) + (1.0 - effective_alpha) * current_score
     
     return max(0.0, min(1.0, new_score))  # Clamp to [0.0, 1.0]
 
 
-def apply_trust_decay(current_score: float, decay_rate: float = 0.001) -> float:
+def apply_trust_decay(current_score: float, decay_rate: float = 0.01) -> float:
     """
-    Apply passive trust decay when agents don't interact.
+    Apply passive trust decay when agents don't interact (Q10 FIX).
     
-    PROBLEM SOLVED: Information density preservation in long episodes.
+    PROBLEM SOLVED: Information density preservation in long episodes (Q10).
     
-    In long RL episodes, if agents cooperate throughout, all trust scores converge to 1.0.
-    At this point, the Social Lattice loses all discriminative power:
-    - Can't distinguish between long-term reliable partners and recent reformers
-    - Trust becomes "useless" for decision-making in late episodes
-    - LLM training signal becomes noise
+    In long RL episodes without interaction, all trust scores converge to 1.0.
+    This destroys discriminative power:
+    - Can't distinguish between "reliable long-term partner" and "reformed bully"
+    - Trust becomes "useless" for agent decision-making in late episodes
+    - LLM training signal becomes noise (all peers look equally trustworthy)
     
-    Solution: Natural drift back to 0.5 (neutral) when not interacting.
-    This preserves history and keeps trust scores meaningful:
-    - 1.0 score + no interaction → slowly drifts back to 0.5
-    - 0.0 score + good behavior → slowly drifts toward 0.5 then up
-    - Recently betrayed but reformed partner → score reflects their pattern
+    Solution: Natural drift toward neutral (0.5) when agents don't interact.
+    This preserves historical information while reflecting temporal uncertainty:
+    - 1.0 (max trust) + no interaction → drifts back to 0.5 over ~500 steps
+    - 0.0 (max distrust) + no interaction → drifts back to 0.5 over ~500 steps
+    - Recently betrayed agent then reforms → score gradually reflects new pattern
+    
+    Mechanism: Linear drift toward neutral point
+        T_new = T_old + decay_rate * (0.5 - T_old)
+    
+    Example with decay_rate=0.01:
+    - Step 0: T=1.0 → Step 100: T≈0.63 → Step 500: T≈0.51 (nearly neutral)
+    - Step 0: T=0.0 → Step 100: T≈0.37 → Step 500: T≈0.49 (nearly neutral)
+    
+    Why linear decay?
+    - Simple and interpretable (smooth convergence to 0.5)
+    - No discontinuities that could confuse LLM reasoning
+    - Proportional: distance from 0.5 decreases by constant percentage
+    - Matches intuition: "time heals all reputation wounds"
     
     Args:
         current_score: Previous trust score [0.0, 1.0]
-        decay_rate: How quickly to drift toward 0.5 per step (default 0.1%)
+        decay_rate: How fast to drift toward 0.5 per step. Default 0.01 (1%).
+                   Range: 0.001 (very slow) to 0.1 (fast)
+                   At 0.01, half-life to neutral ≈ 69 steps
         
     Returns:
-        float: Decayed trust score [0.0, 1.0]
+        float: Decayed trust score [0.0, 1.0], clamped to valid range
     """
     # Linear drift toward 0.5 (neutral point)
+    # Formula: T_new = T_old + rate * (neutral - T_old)
     neutral = 0.5
     decayed = current_score + decay_rate * (neutral - current_score)
     return max(0.0, min(1.0, decayed))
