@@ -47,31 +47,29 @@ class ParseResult:
 
 class NexusActionParser:
     """
-    Robust parser for LLM-generated action text.
+    GREEDY parser for LLM-generated action text.
+    
+    Key Innovation: Extracts ONLY digits, completely ignoring units/suffixes.
     
     Handles:
-    - Chain-of-thought reasoning (ignores preamble)
+    - LLM suffixes: "15P", "15E", "15 units", "15...", "15.0P"
+    - Chain-of-thought reasoning with "ACTION:" anchor
     - Case-insensitive commands
-    - Whitespace variations
     - Malformed input (fallback to WAIT)
-    - Type validation
+    - Full validation
     
     Example:
-        text = "I should propose to agent 1 because they're friendly. PROPOSE 1 30 20"
+        text = "I should propose... ACTION: PROPOSE 1 15P 10..."
         result = parser.parse(text)
-        # → NexusRlAction(PROPOSE, target_id=1, offer_E=30, request_C=20)
+        # → NexusRlAction(PROPOSE, target_id=1, offer_E=15, request_C=10)
+        # The 'P' and '...' are completely ignored by greedy regex.
     """
     
-    # Command tokens used by robust parser logic.
+    # Command tokens
     COMMANDS = ["PROPOSE", "ACCEPT", "REJECT", "WORK", "VAULT", "WAIT"]
     
     def __init__(self, max_resource: int = 100):
-        """
-        Initialize the parser.
-        
-        Args:
-            max_resource: Maximum allowed resource amount (for validation)
-        """
+        """Initialize the parser."""
         self.max_resource = max_resource
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
     
@@ -79,53 +77,41 @@ class NexusActionParser:
         """
         Parse LLM output text into a NexusRlAction.
         
-        Strategy:
-        1. Find command keywords (PROPOSE, ACCEPT, REJECT, WORK, VAULT, WAIT)
-        2. If multiple commands appear, use the LAST one (final intent)
-        3. Extract numbers after that command, ignoring units/punctuation
-        4. Validate extracted values (ranges, types)
+        GREEDY STRATEGY:
+        1. Anchor to 'ACTION:' keyword to skip 'THOUGHT:' section
+        2. Find command keyword (PROPOSE, ACCEPT, REJECT, WORK, VAULT, WAIT)
+        3. Extract ONLY numbers after command, ignoring all non-numeric chars
+        4. Map numbers to parameters based on command type
+        5. Validate ranges and return
         
         Args:
-            text: Raw LLM output (may include reasoning, explanations)
+            text: Raw LLM output (may include THOUGHT: section and suffixes)
             agent_id: ID of the agent taking the action
             
         Returns:
-            ParseResult containing:
-            - action: NexusRlAction (or default WAIT if parse fails)
-            - confidence: 0.0-1.0 confidence score
-            - parse_error: Error message if parsing failed
-            - raw_text: Original input (for debugging)
+            ParseResult containing action, confidence, and optional error message
         """
         if not text or not isinstance(text, str):
-            return ParseResult(
-                action=NexusRlAction(action_type="WAIT"),
-                confidence=0.0,
-                parse_error="Invalid input: text must be non-empty string",
-                raw_text=str(text)
-            )
+            return self._fallback("Invalid input: text must be non-empty string", text)
 
         text_upper = text.upper()
 
-        # Choose the last mentioned command to capture final intent in CoT text.
-        candidates = []
-        for cmd in self.COMMANDS:
-            for match in re.finditer(rf'\b{cmd}\b', text_upper):
-                candidates.append((match.start(), cmd))
+        # 1. ANCHOR: Find 'ACTION:' to skip THOUGHT section
+        action_start = text_upper.find("ACTION:")
+        search_space = text_upper[action_start:] if action_start != -1 else text_upper
 
+        # 2. Find the LAST mentioned command (captures final intent in CoT)
         found_cmd = None
         cmd_idx = -1
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            cmd_idx, found_cmd = candidates[-1]
+        for cmd in self.COMMANDS:
+            idx = search_space.rfind(cmd)  # rfind = rightmost (last) occurrence
+            if idx > cmd_idx:
+                cmd_idx = idx
+                found_cmd = cmd
 
         if not found_cmd:
-            self.logger.warning(f"No valid action found in: {text[:100]}...")
-            return ParseResult(
-                action=NexusRlAction(action_type="WAIT"),
-                confidence=0.0,
-                parse_error="❌ PARSE ERROR: No valid action keyword detected. Expected: PROPOSE, ACCEPT, REJECT, WORK, VAULT, or WAIT",
-                raw_text=text
-            )
+            self.logger.warning(f"No valid action in: {text[:100]}...")
+            return self._fallback("No valid keyword (PROPOSE, WAIT, etc.) found", text)
 
         if found_cmd == "WAIT":
             return ParseResult(
@@ -135,20 +121,16 @@ class NexusActionParser:
                 raw_text=text
             )
 
-        # Extract all numeric values after the command; ignores units and punctuation.
-        search_space = text[cmd_idx + len(found_cmd):]
-        numbers = re.findall(r"[-+]?\d*\.\d+|\d+", search_space)
+        # 3. THE GREEDY FIX: Extract ONLY numbers after command
+        # This ignores 'P', 'E', '...', and any other LLM junk
+        numeric_part = search_space[cmd_idx + len(found_cmd):]
+        numbers = re.findall(r"[-+]?\d*\.\d+|\d+", numeric_part)
 
         try:
             if found_cmd == "PROPOSE":
                 if len(numbers) < 3:
-                    return ParseResult(
-                        action=NexusRlAction(action_type="WAIT"),
-                        confidence=0.0,
-                        parse_error="❌ PARSE ERROR: PROPOSE requires 3 numbers: target_id offer_E request_C",
-                        raw_text=text
-                    )
-
+                    return self._fallback("PROPOSE needs 3 numbers (target_id offer_E request_C)", text)
+                
                 target_id = int(float(numbers[0]))
                 offer_e = int(float(numbers[1]))
                 request_c = int(float(numbers[2]))
@@ -167,15 +149,10 @@ class NexusActionParser:
                     raw_text=text
                 )
 
-            if found_cmd in ["ACCEPT", "REJECT"]:
+            elif found_cmd in ["ACCEPT", "REJECT"]:
                 if len(numbers) < 1:
-                    return ParseResult(
-                        action=NexusRlAction(action_type="WAIT"),
-                        confidence=0.0,
-                        parse_error=f"❌ PARSE ERROR: {found_cmd} requires 1 number: target_id",
-                        raw_text=text
-                    )
-
+                    return self._fallback(f"{found_cmd} needs 1 number (target_id)", text)
+                
                 target_id = int(float(numbers[0]))
                 errors = self._validate_target_id(target_id, agent_id)
 
@@ -190,15 +167,10 @@ class NexusActionParser:
                     raw_text=text
                 )
 
-            if found_cmd in ["WORK", "VAULT"]:
+            elif found_cmd in ["WORK", "VAULT"]:
                 if len(numbers) < 2:
-                    return ParseResult(
-                        action=NexusRlAction(action_type="WAIT"),
-                        confidence=0.0,
-                        parse_error=f"❌ PARSE ERROR: {found_cmd} requires 2 numbers: offer_E request_C",
-                        raw_text=text
-                    )
-
+                    return self._fallback(f"{found_cmd} needs 2 numbers (offer_E request_C)", text)
+                
                 offer_e = int(float(numbers[0]))
                 request_c = int(float(numbers[1]))
                 errors = self._validate_work(offer_e, request_c, agent_id) if found_cmd == "WORK" else self._validate_vault(offer_e, request_c, agent_id)
@@ -217,109 +189,65 @@ class NexusActionParser:
 
         except Exception as e:
             self.logger.warning(f"{found_cmd} parse error: {e}")
-            return ParseResult(
-                action=NexusRlAction(action_type="WAIT"),
-                confidence=0.0,
-                parse_error=f"❌ PARSE ERROR: Internal parse failure: {str(e)}",
-                raw_text=text
-            )
+            return self._fallback(f"Internal parse failure: {str(e)}", text)
 
-        # Should not be reachable, but keep a safe fallback.
+        return self._fallback("Unhandled command state", text)
+
+    def _fallback(self, msg: str, raw: str) -> ParseResult:
+        """Helper: Return WAIT action with error message."""
         return ParseResult(
             action=NexusRlAction(action_type="WAIT"),
             confidence=0.0,
-            parse_error="❌ PARSE ERROR: Unhandled command mapping",
-            raw_text=text
+            parse_error=f"❌ PARSE ERROR: {msg}",
+            raw_text=raw
         )
 
     def _validate_propose(
         self, target_id: int, offer_e: int, request_c: int, agent_id: int
     ) -> List[str]:
-        """
-        Validate PROPOSE parameters before creating action.
-        
-        Returns:
-            List of error messages (empty if valid)
-        """
+        """Validate PROPOSE parameters."""
         errors = []
-        
-        # Target validation
         if target_id == agent_id:
             errors.append(f"Cannot propose to yourself (agent {agent_id})")
         if target_id < 0:
             errors.append(f"Invalid target ID: {target_id} (must be >= 0)")
-        
-        # Resource validation
         if offer_e < 0 or offer_e > self.max_resource:
             errors.append(f"Invalid energy offer: {offer_e} (must be 0-{self.max_resource})")
         if request_c < 0 or request_c > self.max_resource:
             errors.append(f"Invalid compute request: {request_c} (must be 0-{self.max_resource})")
-        
         if offer_e == 0 and request_c == 0:
             errors.append("Cannot propose zero energy and zero compute")
-        
         return errors
     
     def _validate_target_id(self, target_id: int, agent_id: int) -> List[str]:
-        """
-        Validate target ID for ACCEPT/REJECT.
-        
-        Returns:
-            List of error messages (empty if valid)
-        """
+        """Validate target ID for ACCEPT/REJECT."""
         errors = []
-        
         if target_id == agent_id:
             errors.append(f"Cannot interact with yourself (agent {agent_id})")
         if target_id < 0:
             errors.append(f"Invalid target ID: {target_id} (must be >= 0)")
-        
         return errors
     
     def _validate_work(self, offer_e: int, request_c: int, agent_id: int) -> List[str]:
-        """
-        Validate WORK (energy production) action parameters.
-        
-        WORK represents the agent using available resources to generate more.
-        This requires having minimum resources to start with.
-        
-        Returns:
-            List of error messages (empty if valid)
-        """
+        """Validate WORK action parameters."""
         errors = []
-        
-        # Resource validation
         if offer_e < 0 or offer_e > self.max_resource:
-            errors.append(f"Invalid energy offer in WORK: {offer_e} (must be 0-{self.max_resource})")
+            errors.append(f"Invalid energy in WORK: {offer_e} (must be 0-{self.max_resource})")
         if request_c < 0 or request_c > self.max_resource:
-            errors.append(f"Invalid compute request in WORK: {request_c} (must be 0-{self.max_resource})")
-        
+            errors.append(f"Invalid compute in WORK: {request_c} (must be 0-{self.max_resource})")
         if offer_e == 0 and request_c == 0:
             errors.append("Cannot WORK with zero energy and zero compute")
-        
         return errors
     
     def _validate_vault(self, offer_e: int, request_c: int, agent_id: int) -> List[str]:
-        """
-        Validate VAULT (compute storage) action parameters.
-        
-        VAULT represents the agent locking resources in secure storage for future use.
-        This requires having minimum resources to vault.
-        
-        Returns:
-            List of error messages (empty if valid)
-        """
+        """Validate VAULT action parameters."""
         errors = []
-        
-        # Resource validation
         if offer_e < 0 or offer_e > self.max_resource:
             errors.append(f"Invalid energy in VAULT: {offer_e} (must be 0-{self.max_resource})")
         if request_c < 0 or request_c > self.max_resource:
             errors.append(f"Invalid compute in VAULT: {request_c} (must be 0-{self.max_resource})")
-        
         if offer_e == 0 and request_c == 0:
             errors.append("Cannot VAULT zero energy and zero compute")
-        
         return errors
 
 
