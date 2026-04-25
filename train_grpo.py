@@ -30,6 +30,7 @@ import sys
 import argparse
 import logging
 from datetime import datetime
+# Optional, Tuple current not used imports
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -37,6 +38,7 @@ import torch
 import numpy as np
 
 # HF Ecosystem
+# unused imports here 
 from transformers import AutoTokenizer, TextIteratorStreamer
 from unsloth import FastLanguageModel, unsloth_fix_chat_templates
 
@@ -94,6 +96,9 @@ class TrainingConfig:
     # Environment
     env_config: ENVConfig = None  # Use default (4-agent cohort)
     invalid_action_penalty: float = -1.0
+    use_llm_npcs: bool = True  # Toggle for dynamic LLM-based NPCs
+    llm_batch_size: int = 4  # Batch size for LLM NPC inference
+    llm_temperature: float = 0.7  # Temperature for LLM NPC sampling
     
     # Logging
     output_dir: str = "./nexus_grpo_output"
@@ -111,6 +116,9 @@ class TrainingConfig:
             # Others are NPC heuristics to provide learning signal
             self.env_config = ENVConfig(
                 num_agents=4,
+                use_llm_npcs=self.use_llm_npcs,
+                llm_batch_size=self.llm_batch_size,
+                llm_temperature=self.llm_temperature,
                 agent_distribution={
                     AgentArchetype.LEARNER: 1,      # Agent 0: The one we're training
                     AgentArchetype.BULLY: 1,        # Agent 1: Greedy (high E, low C)

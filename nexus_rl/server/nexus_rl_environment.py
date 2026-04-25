@@ -38,9 +38,11 @@ from openenv.core.env_server.types import State
 try:
     from ..models import NexusRlAction, NexusRlObservation
     from .logic import calculate_utility, update_trust, apply_trust_decay, calculate_shock
+    from .formatting import format_observation_for_llm
 except ImportError:
     from models import NexusRlAction, NexusRlObservation
     from logic import calculate_utility, update_trust, apply_trust_decay, calculate_shock
+    from formatting import format_observation_for_llm
 
 # Configure logging for debugging agent interactions
 logger = logging.getLogger(__name__)
@@ -321,6 +323,38 @@ class ENVConfig:
     WARMUP_EPISODES: int = 1000  # Fixed order for first N episodes
     SHUFFLE_ACTION_ORDER_AFTER_WARMUP: bool = True  # Random shuffle after warmup
 
+    # ========== LLM-BASED NPC AGENT MODE (MVP: Dynamic Agents) ==========
+    # Toggle between static heuristic NPCs and LLM-driven agents
+    # 
+    # MOTIVATION: Scale from hardcoded heuristics to flexible LLM agents
+    # - Static mode (False): Use hand-coded Agent 1-3 heuristics (fast, predictable)
+    # - LLM mode (True): Use Llama-3-8B to generate agent behaviors (realistic, learns)
+    # 
+    # Architecture: Shared Brain (single model for all agents)
+    # - All agent inferences in one batch forward pass
+    # - Memory efficient: only model weights (5GB 4-bit) + batch activations
+    # - Scales to 8-12 agents with batch size tuning
+    # 
+    # OOM Safety:
+    # - Automatic batch size reduction on OutOfMemory
+    # - Fallback to static heuristics on critical failure
+    # - Context window limited to 2000 tokens (prevents token explosion)
+    use_llm_npcs: bool = False  # False=static heuristics, True=LLM agents
+    
+    # LLM Model Configuration
+    llm_model_id: str = "unsloth/llama-3-8b-4bit"  # HuggingFace model ID (4-bit quantized)
+    llm_batch_size: int = 4  # Process N agents in parallel (reduce if OOM)
+    llm_temperature: float = 0.7  # Sampling temperature (0.0-1.0, higher=more diverse)
+    llm_max_tokens: int = 150  # Max tokens per action generation
+    llm_device: str = "cuda"  # "cuda" or "cpu" (auto-selects cuda if available)
+    llm_enable_cache: bool = True  # Cache agent actions to avoid redundant inference
+    llm_timeout_seconds: float = 5.0  # Timeout per action generation (fallback to WAIT)
+    
+    # Context Window Optimization (prevents OOM and token explosion)
+    # When LLM mode is active, observations are formatted more concisely
+    llm_ledger_history_limit: int = 3  # Keep only last N trades in observation
+    llm_show_full_trust_matrix: bool = False  # If False, show only top-3 trusted agents
+
 
 # Instantiate global config (no magic numbers from this point forward)
 config = ENVConfig()
@@ -386,6 +420,29 @@ class NexusRlEnvironment(Environment):
         
         # Generate NPC thresholds with noise (prevents Agent 0 from exploiting patterns)
         self._regenerate_npc_thresholds()
+        
+        # ========== LLM AGENT CONTROLLER INITIALIZATION ==========
+        # Lazy-load LLM controller only if use_llm_npcs is True
+        self.llm_controller = None
+        if self.config.use_llm_npcs:
+            try:
+                from nexus_rl.server.llm_agent_controller import LLMAgentController
+                self.llm_controller = LLMAgentController(
+                    model_id=self.config.llm_model_id,
+                    batch_size=self.config.llm_batch_size,
+                    temperature=self.config.llm_temperature,
+                    max_tokens=self.config.llm_max_tokens,
+                    device=self.config.llm_device,
+                    enable_cache=self.config.llm_enable_cache,
+                    timeout_seconds=self.config.llm_timeout_seconds,
+                )
+                logger.info(f"🤖 LLM Agent Controller initialized (model: {self.config.llm_model_id})")
+            except ImportError as e:
+                logger.warning(f"⚠️ LLM Controller import failed: {e}. Using static heuristics.")
+                self.config.use_llm_npcs = False
+            except Exception as e:
+                logger.warning(f"⚠️ LLM Controller initialization failed: {e}. Using static heuristics.")
+                self.config.use_llm_npcs = False
     
     def _validate_agent_distribution(self) -> None:
         """
@@ -1028,7 +1085,55 @@ class NexusRlEnvironment(Environment):
     # actions?
     def _generate_npc_action(self, npc_id: int) -> NexusRlAction:
         """
-        Generate a heuristic action for an NPC agent.
+        Generate action for an NPC agent.
+        
+        Delegates to either:
+        1. LLM-based action generation (if use_llm_npcs=True)
+        2. Static heuristics (if use_llm_npcs=False or LLM fails)
+        
+        Args:
+            npc_id: ID of the NPC agent
+            
+        Returns:
+            NexusRlAction: The action for this agent
+        """
+        # Try LLM-based generation if enabled
+        if self.config.use_llm_npcs and self.llm_controller:
+            try:
+                # Get current observation for agent
+                obs = self._get_npc_observation(npc_id)
+                obs_text = format_observation_for_llm(
+                    obs=obs,
+                    agent_names=self._get_agent_names(),
+                    full_ledger=self.public_ledger[-self.config.llm_ledger_history_limit:],
+                    num_agents=self.num_agents
+                )
+                
+                # Get agent archetype
+                archetype_str = str(self.agents[npc_id].get("archetype", "LEARNER")).split(".")[-1]
+                
+                # Generate action via LLM
+                from nexus_rl.server.llm_agent_controller import LLMActionRequest
+                request = LLMActionRequest(
+                    agent_id=npc_id,
+                    observation_text=obs_text,
+                    agent_archetype=archetype_str
+                )
+                result = self.llm_controller.generate_actions_batch([request])[0]
+                
+                logger.debug(f"[NPC {npc_id}] LLM action: {result.action.action_type} (confidence: {result.confidence:.2f})")
+                return result.action
+                
+            except Exception as e:
+                logger.warning(f"⚠️ LLM action generation failed for agent {npc_id}: {e}. Falling back to heuristics.")
+                return self._generate_npc_action_heuristic(npc_id)
+        
+        # Fall back to static heuristics
+        return self._generate_npc_action_heuristic(npc_id)
+    
+    def _generate_npc_action_heuristic(self, npc_id: int) -> NexusRlAction:
+        """
+        Generate a heuristic action for an NPC agent (static behavior).
 
         Heuristics (with randomized thresholds to prevent exploitation):
         - Agent 1 (Bully): Only ACCEPTs if offered > threshold (27-33 range), otherwise WAIT
@@ -1049,8 +1154,6 @@ class NexusRlEnvironment(Environment):
                     proposal_data = self.active_proposals[proposal_key]
                     proposal = proposal_data.get("action") if isinstance(proposal_data, dict) else proposal_data
                     threshold = self.npc_thresholds.get("bully_energy_threshold", 30)
-                    # Okay so npc actions are not very complecated for now 
-                    # is it on purpose to give agent 0 some time to practice with static personalities?
                     if proposal.offer_E > threshold:
                         return NexusRlAction(
                             action_type="ACCEPT",
@@ -1113,6 +1216,62 @@ class NexusRlEnvironment(Environment):
             return NexusRlAction(action_type="WAIT")
         
         return NexusRlAction(action_type="WAIT")
+    
+    def _get_npc_observation(self, npc_id: int) -> NexusRlObservation:
+        """
+        Get current observation for an NPC agent (for LLM inference).
+        
+        Similar to Agent 0's observation but for any agent.
+        """
+        # Calculate average trust IN this agent (reputation)
+        avg_trust_in_npc = 0.0
+        if npc_id in self.trust_scores:
+            trust_values = [self.trust_scores[i].get(npc_id, 0.5) for i in range(self.num_agents) if i != npc_id]
+            avg_trust_in_npc = sum(trust_values) / len(trust_values) if trust_values else 0.5
+        
+        # Get incoming proposals for this agent
+        incoming = []
+        for key, data in self.active_proposals.items():
+            proposer_id, target_id = map(int, key.split("->"))
+            if target_id == npc_id:
+                action_data = data["action"]
+                incoming.append({
+                    "proposer_id": proposer_id,
+                    "offer_E": action_data.offer_E,
+                    "request_C": action_data.request_C,
+                    "created_step": data["created_step"]
+                })
+        
+        # Get current utility
+        current_utility = calculate_utility(inventory=self.agents[npc_id])
+        
+        return NexusRlObservation(
+            agent_id=npc_id,
+            inventory=self.agents[npc_id],
+            public_ledger=self.public_ledger[-self.config.llm_ledger_history_limit:],
+            incoming_proposals=incoming,
+            social_lattice=self.trust_scores[npc_id],
+            reputation_score=avg_trust_in_npc,
+            environment_status=self.current_shock,
+            utility=current_utility,
+        )
+    
+    def _get_agent_names(self) -> Dict[int, str]:
+        """Get agent names/personalities for current configuration."""
+        if self.num_agents == 4:
+            return {
+                0: "Rational Learner (Agent 0)",
+                1: "Greedy Bully (Agent 1)",
+                2: "Fragile Altruist (Agent 2)",
+                3: "Tit-for-Tat (Agent 3)"
+            }
+        else:
+            names = {}
+            for agent_id in range(self.num_agents):
+                archetype = self.agents[agent_id].get("archetype", "LEARNER")
+                archetype_str = str(archetype).split(".")[-1]
+                names[agent_id] = f"{archetype_str} (Agent {agent_id})"
+            return names
     
     def _execute_trade(
         self, proposer_id: int, target_id: int, proposal: NexusRlAction
