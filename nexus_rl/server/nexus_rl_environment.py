@@ -307,6 +307,10 @@ class ENVConfig:
     MAX_EPISODE_STEPS: int = 1000  # Hard limit (can be lowered)
     FAILURE_UTILITY_THRESHOLD: int = 0  # If U <= 0, episode should end
     
+    # ========== MARKET MICROSTRUCTURE (PHASE 3) ==========
+    SUBSET_SIZE: int = 2        # Number of agents visible for trade per turn
+    WAITING_TAX: float = 0.1    # Penalty for WAIT action to prevent Patience Leech
+    
     # ========== EXECUTION FAIRNESS ==========
     # First-mover advantage prevention
     # 
@@ -467,11 +471,19 @@ class NexusRlEnvironment(Environment):
         for agent_id, arch_config in enumerate(agent_configs):
             self.agents[agent_id] = {
                 # Energy: split into available and locked pools
-                "E_available": arch_config.energy_init,
-                "E_locked": 0,
+                "E_available": float(arch_config.energy_init),
+                "E_locked": 0.0,
                 # Compute: split into available and locked pools
-                "C_available": arch_config.compute_init,
-                "C_locked": 0,
+                "C_available": float(arch_config.compute_init),
+                "C_locked": 0.0,
+                # Phase 3 Enhancements
+                "collateral": 20.0,
+                "tax_immunity": 0,
+                "E_vault": 0.0,
+                "C_vault": 0.0,
+                "commitment_E": 0,
+                "commitment_C": 0,
+                "commitment_target": None,
                 # Metadata
                 "archetype": arch_config.archetype
             }
@@ -509,8 +521,8 @@ class NexusRlEnvironment(Environment):
         """
         agent = self.agents[agent_id]
         return (
-            agent.get("E_available", 0) + agent.get("E_locked", 0),
-            agent.get("C_available", 0) + agent.get("C_locked", 0)
+            agent.get("E_available", 0) + agent.get("E_locked", 0) + agent.get("E_vault", 0),
+            agent.get("C_available", 0) + agent.get("C_locked", 0) + agent.get("C_vault", 0)
         )
     
     def _get_agent_available_resources(self, agent_id: int) -> tuple:
@@ -675,12 +687,13 @@ class NexusRlEnvironment(Environment):
                 expired_proposals.append(proposal_key)
         
         for key in expired_proposals:
-            # INVENTORY LOCKING: Unlock resources when proposal expires
             proposal_data = self.active_proposals[key]
             action = proposal_data.get("action")
             if action and action.action_type == "PROPOSE":
                 proposer_id = int(key.split("->")[0])
                 self._unlock_resources(proposer_id, action.offer_E)
+                # Time Tax for expiring proposal
+                self.agents[proposer_id]["collateral"] = max(0.0, self.agents[proposer_id]["collateral"] - 0.5)
             del self.active_proposals[key]
         
         # ============================================================
@@ -706,17 +719,75 @@ class NexusRlEnvironment(Environment):
         # ============================================================
         # 5. Register Agent 0's Action (if valid)
         # ============================================================
-        if not validation_errors and action.action_type == "PROPOSE":
-            proposal_key = f"{agent_0_id}->{action.target_id}"
-            # INVENTORY LOCKING: Lock the proposed energy to prevent double-spending
-            if self._lock_resources(agent_0_id, action.offer_E, 0):
-                self.active_proposals[proposal_key] = {
-                    "action": action,
-                    "created_step": self._state.step_count
-                }
-            else:
-                # Insufficient available energy, add to validation errors
-                validation_errors.append(f"Insufficient available energy to lock {action.offer_E}")
+        if not validation_errors:
+            # Decay immunity per step
+            for agent_id in range(self.num_agents):
+                if self.agents[agent_id].get("tax_immunity", 0) > 0:
+                    self.agents[agent_id]["tax_immunity"] -= 1
+            
+            # WAITING TAX: Prevent "Patience Leech" exploit
+            if action.action_type == "WAIT":
+                self.agents[agent_0_id]["collateral"] = max(0.0, self.agents[agent_0_id]["collateral"] - self.config.WAITING_TAX)
+
+            if action.action_type == "PROPOSE":
+                # SUBSET SCANNING: Only allow proposing to a subset of agents
+                # This simulates market friction and saves O(N) at scale
+                valid_targets = [i for i in range(self.num_agents) if i != agent_0_id]
+                random.shuffle(valid_targets)
+                market_subset = valid_targets[:self.config.SUBSET_SIZE]
+                
+                if action.target_id not in market_subset:
+                    validation_errors.append(f"Target {action.target_id} not in current market subset {market_subset}")
+                else:
+                    proposal_key = f"{agent_0_id}->{action.target_id}"
+                    
+                    # Check commitment
+                    agent = self.agents[agent_0_id]
+                    if agent.get("commitment_target") == action.target_id:
+                        if action.offer_E < agent.get("commitment_E", 0) or action.request_C > agent.get("commitment_C", 0):
+                            agent["collateral"] = max(0.0, agent["collateral"] - 2.0)  # Broken promise penalty
+                    
+                    # Listing fee & stake
+                    if agent["collateral"] >= 1.0:
+                        agent["collateral"] -= 1.0
+                        
+                        if self._lock_resources(agent_0_id, action.offer_E, 0):
+                            self.active_proposals[proposal_key] = {
+                                "action": action,
+                                "created_step": self._state.step_count
+                            }
+                        else:
+                            validation_errors.append(f"Insufficient available energy to lock {action.offer_E}")
+                            agent["collateral"] += 1.0 # refund
+                    else:
+                        validation_errors.append("Insufficient collateral to propose")
+            
+            elif action.action_type == "WORK":
+                # spend 5E get 2C, tax immunity 5
+                agent = self.agents[agent_0_id]
+                if action.offer_E > 0 and agent["E_available"] >= 5:
+                    agent["E_available"] -= 5
+                    agent["C_available"] += 2
+                    agent["tax_immunity"] = 5
+                elif action.request_C > 0 and agent["C_available"] >= 5:
+                    agent["C_available"] -= 5
+                    agent["E_available"] += 2
+                    agent["tax_immunity"] = 5
+                    
+            elif action.action_type == "VAULT":
+                agent = self.agents[agent_0_id]
+                if action.offer_E > 0 and agent["E_available"] >= action.offer_E:
+                    agent["E_available"] -= action.offer_E
+                    agent["E_vault"] += action.offer_E
+                if action.request_C > 0 and agent["C_available"] >= action.request_C:
+                    agent["C_available"] -= action.request_C
+                    agent["C_vault"] += action.request_C
+                    
+            elif action.action_type == "SIGNAL":
+                agent = self.agents[agent_0_id]
+                agent["commitment_E"] = action.signal_offer_E
+                agent["commitment_C"] = action.signal_request_C
+                agent["commitment_target"] = action.target_id
         
         # ============================================================
         # 6. Generate NPC Reactions
@@ -891,18 +962,22 @@ class NexusRlEnvironment(Environment):
         total_delta_utility_others = 0.0
         for other_id in range(self.num_agents):
             if other_id != agent_0_id:
-                other_utility = calculate_utility(
-                    self.agents[other_id]["E"],
-                    self.agents[other_id]["C"]
-                )
+                total_e_other, total_c_other = self._get_agent_total_resources(other_id)
+                other_utility = calculate_utility(total_e_other, total_c_other)
                 delta_utility_other = other_utility - self.previous_utilities[other_id]
                 total_delta_utility_others += delta_utility_other
         
         # Social Welfare Reward Function
-        # R = Agent 0's gain + λ * (System welfare gain)
         agent_0_reward_component = self.config.REWARD_WEIGHT_UTILITY * delta_utility_agent_0
         system_welfare_component = self.config.ALTRUISM_COEFFICIENT * total_delta_utility_others
-        reward = agent_0_reward_component + system_welfare_component
+        
+        # Penalize loss of collateral
+        delta_collateral = self.agents[agent_0_id]["collateral"] - self.previous_collateral if hasattr(self, 'previous_collateral') else 0.0
+        self.previous_collateral = self.agents[agent_0_id]["collateral"]
+        
+        collateral_component = min(0.0, delta_collateral) # Only penalize loss, don't reward hoarding
+        
+        reward = agent_0_reward_component + system_welfare_component + collateral_component
         
         # Calculate trust metrics for observation (instrumental, not terminal)
         trust_in_me = [
@@ -912,13 +987,9 @@ class NexusRlEnvironment(Environment):
         avg_trust_in_me = np.mean(trust_in_me) if trust_in_me else 0.5
         
         # Update previous utilities for next step
-        self.previous_utilities[agent_0_id] = current_utility
-        
-        for npc_id in range(1, self.num_agents):
-            self.previous_utilities[npc_id] = calculate_utility(
-                self.agents[npc_id]["E"],
-                self.agents[npc_id]["C"]
-            )
+        for agent_id in range(self.num_agents):
+            total_e, total_c = self._get_agent_total_resources(agent_id)
+            self.previous_utilities[agent_id] = calculate_utility(total_e, total_c)
         
         # For logging/debugging: Show reward components
         reward_info = {
@@ -945,11 +1016,26 @@ class NexusRlEnvironment(Environment):
             done = True
             logger.info(f"[Step {self._state.step_count}] Episode ended at MAX_EPISODE_STEPS.")
             
+        # POPULATE INCOMING PROPOSALS: Filter active proposals targeting Agent 0
+        incoming = []
+        for key, data in self.active_proposals.items():
+            proposer_id, target_id = map(int, key.split("->"))
+            if target_id == agent_0_id:
+                action_data = data["action"]
+                incoming.append({
+                    "proposer_id": proposer_id,
+                    "offer_E": action_data.offer_E,
+                    "request_C": action_data.request_C,
+                    "created_step": data["created_step"]
+                })
+
         obs = NexusRlObservation(
             agent_id=agent_0_id,
             inventory=self.agents[agent_0_id],
             public_ledger=self.public_ledger[-self.config.LEDGER_HISTORY_SIZE:],  # Last N transactions
+            incoming_proposals=incoming,
             social_lattice=self.trust_scores[agent_0_id],
+            reputation_score=avg_trust_in_me,
             environment_status=self.current_shock,
             utility=current_utility,
             done=done,
@@ -1114,6 +1200,9 @@ class NexusRlEnvironment(Environment):
             
             self.agents[target_id]["E_available"] += offer_E
             self.agents[target_id]["C_available"] -= request_C
+            
+            # Return partial collateral stake to proposer since trade succeeded
+            self.agents[proposer_id]["collateral"] += 0.9
         else:
             # Trade failed: Unlock proposer's reserved energy
             if proposal_key in self.active_proposals:
@@ -1159,6 +1248,10 @@ class NexusRlEnvironment(Environment):
                 agent = self.agents[agent_id]
                 agent_energy = agent.get("E_available", 0) + agent.get("E_locked", 0)
                 
+                # Check Tax Immunity (from WORK)
+                if agent.get("tax_immunity", 0) > 0:
+                    continue  # Immune to shock
+                    
                 # ASYMMETRIC: Rich agents lose more (1.5x multiplier if above average)
                 wealth_ratio = agent_energy / avg_energy if avg_energy > 0 else 1.0
                 asymmetric_loss_pct = loss_pct * (1.0 + max(0, wealth_ratio - 1.0) * 0.5)
@@ -1191,6 +1284,10 @@ class NexusRlEnvironment(Environment):
                 agent = self.agents[agent_id]
                 agent_compute = agent.get("C_available", 0) + agent.get("C_locked", 0)
                 
+                # Check Tax Immunity (from WORK)
+                if agent.get("tax_immunity", 0) > 0:
+                    continue  # Immune to shock
+                    
                 # ASYMMETRIC: Rich agents lose more
                 wealth_ratio = agent_compute / avg_compute if avg_compute > 0 else 1.0
                 asymmetric_loss_pct = loss_pct * (1.0 + max(0, wealth_ratio - 1.0) * 0.5)
@@ -1216,27 +1313,31 @@ class NexusRlEnvironment(Environment):
         The "Hunger" Mechanic:
         Each agent consumes DECAY_E_PER_STEP Energy and DECAY_C_PER_STEP Compute.
         
-        Design Decision:
-        - If decay > 0: Forces cooperation (agents must trade to survive)
-        - If decay = 0: Allows stalemate (status quo bias exploitation)
-        
-        Tuning:
-        - Start with decay=0 (pure cooperation test)
-        - Increase to 1 if Agent 0 learns to exploit equilibrium
-        - Monitor: Does decay incentivize fair trades or desperation trades?
-        
-        TODO: Weight decay by agent contribution (punish parasites more)
+        Decay is deducted from AVAILABLE resources first, then LOCKED resources
+        if available is insufficient.
         """
         for agent_id in range(self.num_agents):
-            # Apply decay with floor at 0 (cannot go negative)
-            self.agents[agent_id]["E"] = max(
-                0, 
-                self.agents[agent_id]["E"] - self.config.DECAY_E_PER_STEP
-            )
-            self.agents[agent_id]["C"] = max(
-                0, 
-                self.agents[agent_id]["C"] - self.config.DECAY_C_PER_STEP
-            )
+            agent = self.agents[agent_id]
+            
+            # 1. Decay Energy
+            e_to_decay = self.config.DECAY_E_PER_STEP
+            if e_to_decay > 0:
+                if agent["E_available"] >= e_to_decay:
+                    agent["E_available"] -= e_to_decay
+                else:
+                    remaining = e_to_decay - agent["E_available"]
+                    agent["E_available"] = 0.0
+                    agent["E_locked"] = max(0.0, agent["E_locked"] - remaining)
+            
+            # 2. Decay Compute
+            c_to_decay = self.config.DECAY_C_PER_STEP
+            if c_to_decay > 0:
+                if agent["C_available"] >= c_to_decay:
+                    agent["C_available"] -= c_to_decay
+                else:
+                    remaining = c_to_decay - agent["C_available"]
+                    agent["C_available"] = 0.0
+                    agent["C_locked"] = max(0.0, agent["C_locked"] - remaining)
     
     def _verify_resource_conservation(self) -> Dict[str, any]:
         """
@@ -1298,12 +1399,41 @@ class NexusRlEnvironment(Environment):
     @property
     def state(self) -> State:
         """
-        Get the current environment state.
+        Get the current environment state (Ground Truth).
 
+        In MARL, the State represents the omniscient view of the environment,
+        containing all agent attributes, trust scores, and hidden variables.
+        
         Returns:
-            Current State with episode_id and step_count
+            Current State object with full environment metadata.
         """
-        # state always consists of this much only?
+        # Calculate reputation scores for all agents for the state dump
+        reputation_scores = {}
+        for i in range(self.num_agents):
+            others_trust = [self.trust_scores[j][i] for j in range(self.num_agents) if i != j]
+            reputation_scores[i] = float(np.mean(others_trust)) if others_trust else 0.5
+
+        # Attach the full ground truth to the state object for serialization
+        # This ensures the API /state endpoint returns individual attributes
+        self._state.metadata = {
+            "agents": self.agents,
+            "trust_scores": self.trust_scores,
+            "reputation_scores": reputation_scores,
+            "active_proposals": {
+                k: {
+                    "action": v["action"].dict() if hasattr(v["action"], "dict") else v["action"],
+                    "created_step": v["created_step"]
+                }
+                for k, v in self.active_proposals.items()
+            },
+            "public_ledger": self.public_ledger,
+            "current_shock": self.current_shock,
+            "npc_thresholds": self.npc_thresholds,
+            "previous_utilities": self.previous_utilities,
+            "reset_count": self._reset_count,
+            "step_count": self._state.step_count,
+            "last_step_reward": reward
+        }
         return self._state
 
     @staticmethod

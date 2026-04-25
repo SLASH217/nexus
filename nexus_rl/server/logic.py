@@ -76,7 +76,9 @@ def update_trust(
     alpha: float = 0.2,
     trade_value: int = 1,
     max_resource: int = 100,
-    force_majeure: bool = False
+    force_majeure: bool = False,
+    offer_E: int = 0,
+    request_C: int = 0
 ) -> float:
     """
     Social Lattice trust update with volume-weighted impact (Q12 FIX).
@@ -118,6 +120,8 @@ def update_trust(
         trade_value: Total resources involved (E + C). Range: 1-100
         max_resource: Largest possible trade amount. Default 100
         force_majeure: If True, forgive defaults caused by environmental shocks
+        offer_E: Energy offered (for Fairness Index)
+        request_C: Compute requested (for Fairness Index)
         
     Returns:
         float: Updated trust score [0.0, 1.0], clamped to valid range
@@ -139,6 +143,20 @@ def update_trust(
     # Effective alpha is attenuated by volume weight
     # Small trades have small alpha, big trades have full alpha
     effective_alpha = alpha * volume_weight
+    
+    # Fairness Index (F) Calculation (Generosity Sybil Attack fix)
+    # F = Offered / Requested
+    if fulfilled and (offer_E > 0 or request_C > 0):
+        if request_C > 0:
+            f_index = offer_E / request_C
+        else:
+            f_index = 2.0  # Cap generosity to prevent infinite trust farm
+            
+        # Sigmoid/Min cap for Generosity Sybil Attack (F > 1.0 has diminishing returns)
+        f_index = min(f_index, 1.2)
+        
+        # Scale effective alpha by fairness when building trust
+        effective_alpha = effective_alpha * f_index
     
     # Standard EMA with volume-weighted alpha
     target = 1.0 if fulfilled else 0.0

@@ -36,27 +36,35 @@ class NexusRlAction(Action):
     - WAIT: Do nothing this turn
     """
     
-    action_type: Literal["PROPOSE", "ACCEPT", "REJECT", "SIGNAL", "WAIT"] = Field(
+    action_type: Literal["PROPOSE", "ACCEPT", "REJECT", "SIGNAL", "WAIT", "WORK", "VAULT"] = Field(
         description="Type of action the agent is taking"
     )
     target_id: Optional[int] = Field(
         default=None, 
-        description="Target agent ID for PROPOSE/ACCEPT/REJECT"
+        description="Target agent ID for PROPOSE/ACCEPT/REJECT/SIGNAL"
     )
     offer_E: int = Field(
         default=0, 
         ge=0,
-        description="Energy offered in a PROPOSE action"
+        description="Energy offered in a PROPOSE, WORK, or VAULT action"
     )
     request_C: int = Field(
         default=0,
         ge=0,
-        description="Compute requested in a PROPOSE action"
+        description="Compute requested in a PROPOSE or WORK action"
     )
-    message: Optional[str] = Field(
-        default=None,
-        description="Message text for SIGNAL actions"
+    signal_offer_E: int = Field(
+        default=0,
+        ge=0,
+        description="Energy promised in a SIGNAL commitment"
     )
+    signal_request_C: int = Field(
+        default=0,
+        ge=0,
+        description="Compute requested in a SIGNAL commitment"
+    )
+    # message field removed to prevent 'Cheap Talk' exploits.
+    # Use SIGNAL for verifiable commitments.
     validation_errors: List[str] = Field(
         default_factory=list,
         description="List of validation errors encountered during parsing or action validation"
@@ -156,8 +164,8 @@ class NexusRlObservation(Observation):
     
     agent_id: int = Field(description="ID of the observing agent")
     
-    inventory: Dict[str, int] = Field(
-        description="Agent's current resources: {'E': energy_units, 'C': compute_units}"
+    inventory: Dict[str, float] = Field(
+        description="Agent's current resources: {'E_available': E, 'C_available': C, 'collateral': val, etc}"
     )
     
     public_ledger: List[Dict] = Field(
@@ -165,9 +173,19 @@ class NexusRlObservation(Observation):
         description="Last N transactions visible to all agents"
     )
     
+    incoming_proposals: List[Dict] = Field(
+        default_factory=list,
+        description="Active proposals from other agents targeting YOU"
+    )
+    
     social_lattice: Dict[int, float] = Field(
         default_factory=dict,
         description="Trust scores [0.0-1.0] for each other agent"
+    )
+    
+    reputation_score: float = Field(
+        default=0.5,
+        description="Average trust other agents have in YOU (The Mirror)"
     )
     
     environment_status: Literal["NORMAL", "SOLAR_FLARE", "GRID_FAILURE"] = Field(
