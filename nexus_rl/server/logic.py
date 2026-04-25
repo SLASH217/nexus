@@ -75,7 +75,8 @@ def update_trust(
     fulfilled: bool,
     alpha: float = 0.2,
     trade_value: int = 1,
-    max_resource: int = 100
+    max_resource: int = 100,
+    force_majeure: bool = False
 ) -> float:
     """
     Social Lattice trust update with volume-weighted impact (Q12 FIX).
@@ -116,10 +117,16 @@ def update_trust(
         alpha: Base learning rate (higher = faster changes). Default 0.2
         trade_value: Total resources involved (E + C). Range: 1-100
         max_resource: Largest possible trade amount. Default 100
+        force_majeure: If True, forgive defaults caused by environmental shocks
         
     Returns:
         float: Updated trust score [0.0, 1.0], clamped to valid range
     """
+    if not fulfilled and force_majeure:
+        # Force Majeure: Default was caused by environmental shock, not malice.
+        # No penalty applied, teaching the agent the difference between bad luck and bad intent.
+        return current_score
+
     import math
     
     # Clamp trade_value to valid range
@@ -180,10 +187,12 @@ def apply_trust_decay(current_score: float, decay_rate: float = 0.01) -> float:
     Returns:
         float: Decayed trust score [0.0, 1.0], clamped to valid range
     """
-    # Linear drift toward 0.5 (neutral point)
-    # Formula: T_new = T_old + rate * (neutral - T_old)
     neutral = 0.5
-    decayed = current_score + decay_rate * (neutral - current_score)
+    if current_score < neutral:
+        # Asymmetric Decay (Pariah Rule): Bad reputation does not passively heal
+        decayed = current_score
+    else:
+        decayed = current_score + decay_rate * (neutral - current_score)
     return max(0.0, min(1.0, decayed))
 
 

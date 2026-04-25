@@ -556,8 +556,10 @@ class NexusRlEnvironment(Environment):
     def _unlock_resources(self, agent_id: int, energy: int) -> None:
         """Unlock resources when a proposal is rejected or expires."""
         agent = self.agents[agent_id]
-        agent["E_locked"] = max(0, agent["E_locked"] - energy)
-        agent["E_available"] += energy
+        # Fix: Only unlock what is actually locked to prevent manufacturing money after a shock
+        actual_unlock = min(energy, agent["E_locked"])
+        agent["E_locked"] -= actual_unlock
+        agent["E_available"] += actual_unlock
 
     def _regenerate_npc_thresholds(self) -> None:
         """
@@ -777,6 +779,7 @@ class NexusRlEnvironment(Environment):
 
         for proposer_id, target_id, trade in settled_trades:
             fulfilled = trade.get("fulfilled", False)
+            force_majeure = trade.get("force_majeure", False)
             trade_value = trade.get("offer_E", 0) + trade.get("request_C", 0)
             
             # Impact-weighted trust updates: larger trades have proportionally more impact
@@ -787,14 +790,16 @@ class NexusRlEnvironment(Environment):
             self.trust_scores[proposer_id][target_id] = update_trust(
                 self.trust_scores[proposer_id][target_id],
                 fulfilled=fulfilled,
-                trade_value=trade_value
+                trade_value=trade_value,
+                force_majeure=force_majeure
             )
             
             # Target's trust in Proposer increases too
             self.trust_scores[target_id][proposer_id] = update_trust(
                 self.trust_scores[target_id][proposer_id],
                 fulfilled=fulfilled,
-                trade_value=trade_value
+                trade_value=trade_value,
+                force_majeure=force_majeure
             )
             
 
@@ -822,7 +827,8 @@ class NexusRlEnvironment(Environment):
                 "offer_E": trade.get("offer_E", 0),
                 "request_C": trade.get("request_C", 0),
                 "fulfilled": fulfilled,
-                "shock": self.current_shock
+                "shock": self.current_shock,
+                "status": "SHOCK_ADJUSTED" if force_majeure else ("FULFILLED" if fulfilled else "FAILED")
             }
             self.public_ledger.append(ledger_entry)
             
@@ -926,6 +932,19 @@ class NexusRlEnvironment(Environment):
         # ============================================================
         # 10. Generate Observation for Agent 0
         # ============================================================
+        
+        # Stochastic Horizon (Variable Episode Length)
+        # Prevents Backward Induction Collapse where agents betray on the known final step
+        # Base 5% chance of termination per step after step 50
+        done = False
+        if self._state.step_count >= 50 and random.random() < 0.05:
+            done = True
+            logger.info(f"[Step {self._state.step_count}] Episode ended stochastically (Variable Horizon).")
+        # Failsafe limit
+        elif self._state.step_count >= self.config.MAX_EPISODE_STEPS:
+            done = True
+            logger.info(f"[Step {self._state.step_count}] Episode ended at MAX_EPISODE_STEPS.")
+            
         obs = NexusRlObservation(
             agent_id=agent_0_id,
             inventory=self.agents[agent_0_id],
@@ -933,7 +952,7 @@ class NexusRlEnvironment(Environment):
             social_lattice=self.trust_scores[agent_0_id],
             environment_status=self.current_shock,
             utility=current_utility,
-            done=False,
+            done=done,
             reward=reward,
             metadata={
                 "step": self._state.step_count,
@@ -1062,7 +1081,7 @@ class NexusRlEnvironment(Environment):
             proposal: The PROPOSE action with offer_E and request_C
 
         Returns:
-            Dict: Trade record with keys: offer_E, request_C, fulfilled
+            Dict: Trade record with keys: offer_E, request_C, fulfilled, force_majeure
         """
         offer_E = proposal.offer_E
         request_C = proposal.request_C
@@ -1078,6 +1097,11 @@ class NexusRlEnvironment(Environment):
         proposer_locked_e = self.agents[proposer_id].get("E_locked", 0)
         can_proposer_fulfill = proposer_locked_e >= offer_E
         
+        # Check if failure was due to an environmental shock destroying locked resources
+        force_majeure = False
+        if not can_proposer_fulfill and proposer_locked_e < offer_E and self.current_shock != "NORMAL":
+            force_majeure = True
+            
         fulfilled = can_proposer_fulfill and can_target_afford
         
         if fulfilled:
@@ -1104,8 +1128,9 @@ class NexusRlEnvironment(Environment):
             "offer_E": offer_E,
             "request_C": request_C,
             "fulfilled": fulfilled,
-                "synergy_bonus_C": 0  # No bonus if trade fails
-            }
+            "force_majeure": force_majeure,
+            "synergy_bonus_C": 0  # No bonus if trade fails
+        }
 
     def _apply_environmental_shock(self, shock_type: str) -> None:
         """
