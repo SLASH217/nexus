@@ -13,7 +13,7 @@ These Pydantic models ensure type safety and prevent hallucination noise.
 
 from openenv.core.env_server.types import Action, Observation
 from pydantic import Field
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Any
 
 
 class NexusRlAction(Action):
@@ -164,8 +164,9 @@ class NexusRlObservation(Observation):
     
     agent_id: int = Field(description="ID of the observing agent")
     
-    inventory: Dict[str, float] = Field(
-        description="Agent's current resources: {'E_available': E, 'C_available': C, 'collateral': val, etc}"
+    # FIX: Change to Any so Enums and None types don't crash the validator
+    inventory: Dict[str, Any] = Field(
+        description="Agent's current resources and metadata: E_available, E_locked, C_available, C_locked, collateral, archetype, etc"
     )
     
     public_ledger: List[Dict] = Field(

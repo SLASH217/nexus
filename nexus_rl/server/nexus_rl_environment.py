@@ -379,11 +379,10 @@ class NexusRlEnvironment(Environment):
         # Pending proposals buffer for async trade settlement
         self.active_proposals: Dict[str, Dict] = {}
         
-        # Track previous utilities for reward delta calculation
+        # FIX: Sync initial utility tracking with the new dual-key system
         self.previous_utilities: Dict[int, float] = {}
         for i in range(self.num_agents):
-            total_e, total_c = self._get_agent_total_resources(i)
-            self.previous_utilities[i] = calculate_utility(total_e, total_c)
+            self.previous_utilities[i] = calculate_utility(inventory=self.agents[i])
         
         # Generate NPC thresholds with noise (prevents Agent 0 from exploiting patterns)
         self._regenerate_npc_thresholds()
@@ -568,10 +567,10 @@ class NexusRlEnvironment(Environment):
     def _unlock_resources(self, agent_id: int, energy: int) -> None:
         """Unlock resources when a proposal is rejected or expires."""
         agent = self.agents[agent_id]
-        # Fix: Only unlock what is actually locked to prevent manufacturing money after a shock
-        actual_unlock = min(energy, agent["E_locked"])
-        agent["E_locked"] -= actual_unlock
-        agent["E_available"] += actual_unlock
+        actual_locked = float(agent.get("E_locked", 0.0))
+        to_unlock = float(min(energy, actual_locked))
+        agent["E_locked"] = max(0.0, actual_locked - to_unlock)
+        agent["E_available"] = float(agent.get("E_available", 0.0)) + to_unlock
 
     def _regenerate_npc_thresholds(self) -> None:
         """
@@ -611,8 +610,10 @@ class NexusRlEnvironment(Environment):
         # Reset utilities tracking
         self.previous_utilities = {}
         for i in range(self.num_agents):
-            total_e, total_c = self._get_agent_total_resources(i)
-            self.previous_utilities[i] = calculate_utility(total_e, total_c)
+            self.previous_utilities[i] = calculate_utility(inventory=self.agents[i])
+        
+        # Initialize collateral tracking for reward calculation
+        self.previous_collateral = self.agents[0].get("collateral", 20.0)
         
         # Generate new NPC thresholds for episode diversity
         self._regenerate_npc_thresholds()
@@ -624,14 +625,13 @@ class NexusRlEnvironment(Environment):
         
         # Return observation for Agent 0
         agent_id = 0
-        total_e, total_c = self._get_agent_total_resources(agent_id)
         return NexusRlObservation(
             agent_id=agent_id,
             inventory=self.agents[agent_id].copy(),
             public_ledger=self.public_ledger.copy(),
             social_lattice=self.trust_scores[agent_id].copy(),
             environment_status=self.current_shock,
-            utility=calculate_utility(total_e, total_c),
+            utility=calculate_utility(inventory=self.agents[agent_id]),
             done=False,
             reward=0.0,
             metadata={"reset_count": self._reset_count, "avg_trust_in_me": 0.5}
@@ -676,6 +676,9 @@ class NexusRlEnvironment(Environment):
             self.agents.get(action.target_id) if action.target_id else None
         )
         validation_errors.extend(action_errors)
+        
+        # FIX: Populate the model's new validation_errors field
+        action.validation_errors = validation_errors
         
         # ============================================================
         # 2. Clean up async proposal buffer (TTL-based expiration)
@@ -808,39 +811,24 @@ class NexusRlEnvironment(Environment):
         # ============================================================
         # 7. Settle Trades (Match PROPOSE with ACCEPT)
         # ============================================================
-        all_actions: Dict[int, NexusRlAction] = {agent_0_id: action, **npc_actions}
         settled_trades: List[Tuple[int, int, Dict]] = []
-        
-        # EXECUTION FAIRNESS: Randomize action processing order after warmup
-        # This prevents first-mover advantage in the proposal buffer
-        if self.config.SHUFFLE_ACTION_ORDER_AFTER_WARMUP and self._reset_count > self.config.WARMUP_EPISODES:
-            # Shuffle agent IDs after warmup period
-            agent_order = list(range(self.num_agents))
-            random.shuffle(agent_order)
-        else:
-            # Fixed order during warmup
-            agent_order = list(range(self.num_agents))
-        
-        # Process trades in (possibly randomized) order
-        for proposer_id in agent_order:
+        all_actions: Dict[int, NexusRlAction] = {0: action, **npc_actions}
+
+        # Golden match: only PROPOSE + reciprocal ACCEPT settles.
+        for proposer_id in range(self.num_agents):
             proposer_action = all_actions.get(proposer_id)
-            if not proposer_action:
-                continue
-            
-            if proposer_action.action_type == "PROPOSE":
+            if proposer_action and proposer_action.action_type == "PROPOSE":
                 target_id = proposer_action.target_id
                 target_action = all_actions.get(target_id)
-                
-                # Check if target ACCEPTs this specific proposal
-                if target_action and target_action.action_type == "ACCEPT":
-                    if target_action.target_id == proposer_id:
-                        # Trade matched!
-                        trade = self._execute_trade(
-                            proposer_id, target_id, proposer_action
-                        )
-                        settled_trades.append(
-                            (proposer_id, target_id, trade)
-                        )
+
+                if (
+                    target_action
+                    and target_action.action_type == "ACCEPT"
+                    and target_action.target_id == proposer_id
+                ):
+                    trade = self._execute_trade(proposer_id, target_id, proposer_action)
+                    if trade.get("fulfilled", False):
+                        settled_trades.append((proposer_id, target_id, trade))
         
         # ============================================================
         # 8. Update Trust Scores
@@ -848,71 +836,45 @@ class NexusRlEnvironment(Environment):
         # The trust update is a simple linear update.
         # a bully can perform a massive betrayal (trust drops), then perform 5 tiny meaningless 1 unit trafes to wash its reputation back to 1.0. the system doesn't weight the value of the trade only the fact that it was fulfilled. 
 
+        # FIX: Trust Updates (Volume-Weighted Signature)
         for proposer_id, target_id, trade in settled_trades:
             fulfilled = trade.get("fulfilled", False)
             force_majeure = trade.get("force_majeure", False)
-            trade_value = trade.get("offer_E", 0) + trade.get("request_C", 0)
+            val = trade.get("offer_E", 0) + trade.get("request_C", 0)
             
-            # Impact-weighted trust updates: larger trades have proportionally more impact
-            # This prevents "wash reputation" exploit: agents can't wipe out a big betrayal
-            # with many tiny trades
-            
-            # Proposer's trust in Target increases if trade happened
-            self.trust_scores[proposer_id][target_id] = update_trust(
+            # Use the updated signature from logic.py
+            new_score = update_trust(
                 self.trust_scores[proposer_id][target_id],
                 fulfilled=fulfilled,
-                trade_value=trade_value,
-                force_majeure=force_majeure
+                trade_value=val,
+                force_majeure=force_majeure,
+                offer_E=trade.get("offer_E", 0),
+                request_C=trade.get("request_C", 0)
             )
-            
-            # Target's trust in Proposer increases too
-            self.trust_scores[target_id][proposer_id] = update_trust(
-                self.trust_scores[target_id][proposer_id],
-                fulfilled=fulfilled,
-                trade_value=trade_value,
-                force_majeure=force_majeure
-            )
-            
+            self.trust_scores[proposer_id][target_id] = self.trust_scores[target_id][proposer_id] = new_score
 
-### **B. Public Ledger vs. Private Dossier (Policy Inference)**
-# * **Public Ledger:** The immutable "Ground Truth" of all finalized transactions.
-# * [cite_start]**Private Dossier:** The agent’s internal model for **Inferring Policies of Other Agents**[cite: 139, 141].
-#     * [cite_start]**ToM Reasoning:** If the Ledger shows a failed trade during a "Solar Flare" status, the agent uses the Dossier to distinguish between **Unfortunate Circumstance** and **Malicious Default**[cite: 57, 58].
-
-# ---   
-    # Now here we run into a issue where the public ledger grows very large when we run lots of episodes, how will we manage such a large database of records.
-    # We can either implement some sort of pagination system where the agent only has access to the last 100 records or we can implement a summarization system where we summarize the past records into a more digestable format for the agent.
-
-            # Record in public ledger with rolling buffer (Q6 FIX: Memory Leak Prevention)
-            # CRITICAL: public_ledger must be bounded to prevent memory explosion in long runs.
-            # In 25,000-episode training, unbounded ledger causes:
-            # - Memory usage: O(episode_length * num_agents^2) → explosion
-            # - LLM context: Full history becomes unmanageable token cost
-            # 
-            # Solution: Rolling buffer keeps only last N transactions
-            # Older trades are summarized into agent dossiers (formatting.py)
+        # Record settled trades in public ledger (bounded rolling history)
+        for p_id, t_id, trade in settled_trades:
+            fulfilled = trade.get("fulfilled", False)
+            force_majeure = trade.get("force_majeure", False)
             ledger_entry = {
                 "step": self._state.step_count,
-                "proposer": proposer_id,
-                "target": target_id,
+                "proposer": p_id,
+                "target": t_id,
                 "offer_E": trade.get("offer_E", 0),
                 "request_C": trade.get("request_C", 0),
-                "fulfilled": fulfilled,
-                "shock": self.current_shock,
-                "status": "SHOCK_ADJUSTED" if force_majeure else ("FULFILLED" if fulfilled else "FAILED")
+                "status": "SHOCK_ADJUSTED" if force_majeure else ("FULFILLED" if fulfilled else "FAILED"),
             }
             self.public_ledger.append(ledger_entry)
-            
-            # Rolling buffer: Keep only last LEDGER_MAX_SIZE transactions
-            # This ensures memory stays bounded: O(LEDGER_MAX_SIZE) not O(episode_length)
+
+            # Memory leak fix: keep only recent history.
             if len(self.public_ledger) > self.config.LEDGER_HISTORY_SIZE:
-                self.public_ledger.pop(0)  # Remove oldest entry
-            
-            # Log settled trades
-            status = "✓ FULFILLED" if fulfilled else "✗ FAILED"
+                self.public_ledger.pop(0)
+
+            status = "FULFILLED" if fulfilled else "FAILED"
             logger.info(
                 f"[Step {self._state.step_count}] Trade {status}: "
-                f"Agent {proposer_id} → Agent {target_id} "
+                f"Agent {p_id} -> Agent {t_id} "
                 f"({trade.get('offer_E', 0)}E for {trade.get('request_C', 0)}C)"
             )
         
@@ -951,19 +913,16 @@ class NexusRlEnvironment(Environment):
         # 3. System thinking: Everyone's welfare matters to your own welfare
         # ═════════════════════════════════════════════════════════════════
         
-        # Calculate Agent 0's utility change
-        current_utility = calculate_utility(
-            self.agents[agent_0_id]["E"],
-            self.agents[agent_0_id]["C"]
-        )
+        # FIX: Reward & Utility (Social Welfare λ=0.5)
+        # Use calculate_utility(inventory=...) to avoid 'E' vs 'E_available' mismatch
+        current_utility = calculate_utility(inventory=self.agents[agent_0_id])
         delta_utility_agent_0 = current_utility - self.previous_utilities[agent_0_id]
         
         # Calculate total utility change for other agents (system welfare)
         total_delta_utility_others = 0.0
         for other_id in range(self.num_agents):
             if other_id != agent_0_id:
-                total_e_other, total_c_other = self._get_agent_total_resources(other_id)
-                other_utility = calculate_utility(total_e_other, total_c_other)
+                other_utility = calculate_utility(inventory=self.agents[other_id])
                 delta_utility_other = other_utility - self.previous_utilities[other_id]
                 total_delta_utility_others += delta_utility_other
         
@@ -977,7 +936,12 @@ class NexusRlEnvironment(Environment):
         
         collateral_component = min(0.0, delta_collateral) # Only penalize loss, don't reward hoarding
         
-        reward = agent_0_reward_component + system_welfare_component + collateral_component
+        # VALIDATION ERROR PENALTY (Q3 FIX: Prevents Invalid Action Spam)
+        # Penalize agent for attempting illegal actions (-1.0 per validation error)
+        # This teaches the LLM to respect inventory constraints and prevents hallucination cascade
+        validation_penalty = -1.0 * len(validation_errors) if validation_errors else 0.0
+        
+        reward = agent_0_reward_component + system_welfare_component + collateral_component + validation_penalty
         
         # Calculate trust metrics for observation (instrumental, not terminal)
         trust_in_me = [
@@ -988,14 +952,14 @@ class NexusRlEnvironment(Environment):
         
         # Update previous utilities for next step
         for agent_id in range(self.num_agents):
-            total_e, total_c = self._get_agent_total_resources(agent_id)
-            self.previous_utilities[agent_id] = calculate_utility(total_e, total_c)
+            self.previous_utilities[agent_id] = calculate_utility(inventory=self.agents[agent_id])
         
         # For logging/debugging: Show reward components
         reward_info = {
             "reward_total": reward,
             "reward_agent_0": agent_0_reward_component,
             "reward_system_welfare": system_welfare_component,
+            "reward_validation_penalty": validation_penalty,
             "delta_utility_agent_0": delta_utility_agent_0,
             "delta_utility_others_total": total_delta_utility_others,
         }
@@ -1051,6 +1015,7 @@ class NexusRlEnvironment(Environment):
                     "total": reward,
                     "agent_0_component": agent_0_reward_component,
                     "system_welfare_component": system_welfare_component,
+                    "validation_penalty": validation_penalty,
                     "delta_utility_agent_0": delta_utility_agent_0,
                     "delta_utility_others_sum": total_delta_utility_others,
                 },
@@ -1096,7 +1061,7 @@ class NexusRlEnvironment(Environment):
         elif npc_id == 2:  # Fragile Altruist (with noise to prevent exploitation)
             desperation_threshold = self.npc_thresholds.get("altruist_desperation_point", self.config.ALTRUIST_DESPERATION_POINT_MEAN)
             # Desperate if Energy < threshold
-            if self.agents[npc_id]["E"] < desperation_threshold:
+            if self.agents[npc_id]["E_available"] < desperation_threshold:
                 # Accept proposals from anyone
                 for proposer_id in [0, 1, 3]:
                     proposal_key = f"{proposer_id}->{npc_id}"
@@ -1137,7 +1102,7 @@ class NexusRlEnvironment(Environment):
                     )
             
             # Default: maintain reciprocal trading with Agent 0
-            if self.agents[3]["E"] > self.config.TITFORTAT_THRESHOLD_E:
+            if self.agents[3]["E_available"] > self.config.TITFORTAT_THRESHOLD_E:
                 return NexusRlAction(
                     action_type="PROPOSE",
                     target_id=0,
