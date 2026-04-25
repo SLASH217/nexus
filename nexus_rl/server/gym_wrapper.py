@@ -62,31 +62,8 @@ class NexusActionParser:
         # → NexusRlAction(PROPOSE, target_id=1, offer_E=30, request_C=20)
     """
     
-    # Regex patterns (case-insensitive, whitespace-flexible)
-    PROPOSE_PATTERN = re.compile(
-        r'\bPROPOSE\s+(\d+)\s+(\d+)\s+(\d+)\b',
-        re.IGNORECASE
-    )
-    ACCEPT_PATTERN = re.compile(
-        r'\bACCEPT\s+(\d+)\b',
-        re.IGNORECASE
-    )
-    REJECT_PATTERN = re.compile(
-        r'\bREJECT\s+(\d+)\b',
-        re.IGNORECASE
-    )
-    WORK_PATTERN = re.compile(
-        r'\bWORK\s+(\d+)\s+(\d+)\b',
-        re.IGNORECASE
-    )
-    VAULT_PATTERN = re.compile(
-        r'\bVAULT\s+(\d+)\s+(\d+)\b',
-        re.IGNORECASE
-    )
-    WAIT_PATTERN = re.compile(
-        r'\bWAIT\b',
-        re.IGNORECASE
-    )
+    # Command tokens used by robust parser logic.
+    COMMANDS = ["PROPOSE", "ACCEPT", "REJECT", "WORK", "VAULT", "WAIT"]
     
     def __init__(self, max_resource: int = 100):
         """
@@ -103,9 +80,9 @@ class NexusActionParser:
         Parse LLM output text into a NexusRlAction.
         
         Strategy:
-        1. Try to find a valid command (PROPOSE, ACCEPT, REJECT, WAIT)
-        2. If multiple commands found, use the FIRST one
-        3. If no command found, return WAIT with parse error
+        1. Find command keywords (PROPOSE, ACCEPT, REJECT, WORK, VAULT, WAIT)
+        2. If multiple commands appear, use the LAST one (final intent)
+        3. Extract numbers after that command, ignoring units/punctuation
         4. Validate extracted values (ranges, types)
         
         Args:
@@ -126,164 +103,135 @@ class NexusActionParser:
                 parse_error="Invalid input: text must be non-empty string",
                 raw_text=str(text)
             )
-        
-        # Try PROPOSE first (most structured, least ambiguous)
-        propose_match = self.PROPOSE_PATTERN.search(text)
-        if propose_match:
-            try:
-                target_id = int(propose_match.group(1))
-                offer_e = int(propose_match.group(2))
-                request_c = int(propose_match.group(3))
-                
-                # Validate ranges
-                errors = self._validate_propose(target_id, offer_e, request_c, agent_id)
-                
-                action = NexusRlAction(
-                    action_type="PROPOSE",
-                    target_id=target_id,
-                    offer_E=offer_e,
-                    request_C=request_c,
-                    validation_errors=errors if errors else []
-                )
-                
-                confidence = 0.95 if not errors else 0.7
-                parse_error = "; ".join(errors) if errors else None
-                
-                return ParseResult(
-                    action=action,
-                    confidence=confidence,
-                    parse_error=parse_error,
-                    raw_text=text
-                )
-            except (ValueError, IndexError) as e:
-                self.logger.warning(f"PROPOSE parse error: {e}")
-        
-        # Try ACCEPT
-        accept_match = self.ACCEPT_PATTERN.search(text)
-        if accept_match:
-            try:
-                target_id = int(accept_match.group(1))
-                errors = self._validate_target_id(target_id, agent_id)
-                
-                action = NexusRlAction(
-                    action_type="ACCEPT",
-                    target_id=target_id,
-                    validation_errors=errors if errors else []
-                )
-                
-                confidence = 0.95 if not errors else 0.7
-                parse_error = "; ".join(errors) if errors else None
-                
-                return ParseResult(
-                    action=action,
-                    confidence=confidence,
-                    parse_error=parse_error,
-                    raw_text=text
-                )
-            except (ValueError, IndexError) as e:
-                self.logger.warning(f"ACCEPT parse error: {e}")
-        
-        # Try REJECT
-        reject_match = self.REJECT_PATTERN.search(text)
-        if reject_match:
-            try:
-                target_id = int(reject_match.group(1))
-                errors = self._validate_target_id(target_id, agent_id)
-                
-                action = NexusRlAction(
-                    action_type="REJECT",
-                    target_id=target_id,
-                    validation_errors=errors if errors else []
-                )
-                
-                confidence = 0.95 if not errors else 0.7
-                parse_error = "; ".join(errors) if errors else None
-                
-                return ParseResult(
-                    action=action,
-                    confidence=confidence,
-                    parse_error=parse_error,
-                    raw_text=text
-                )
-            except (ValueError, IndexError) as e:
-                self.logger.warning(f"REJECT parse error: {e}")
-        
-        # Try WORK (energy production action)
-        work_match = self.WORK_PATTERN.search(text)
-        if work_match:
-            try:
-                offer_e = int(work_match.group(1))
-                request_c = int(work_match.group(2))
-                
-                errors = self._validate_work(offer_e, request_c, agent_id)
-                
-                action = NexusRlAction(
-                    action_type="WORK",
-                    offer_E=offer_e,
-                    request_C=request_c,
-                    validation_errors=errors if errors else []
-                )
-                
-                confidence = 0.95 if not errors else 0.7
-                parse_error = "; ".join(errors) if errors else None
-                
-                return ParseResult(
-                    action=action,
-                    confidence=confidence,
-                    parse_error=parse_error,
-                    raw_text=text
-                )
-            except (ValueError, IndexError) as e:
-                self.logger.warning(f"WORK parse error: {e}")
-        
-        # Try VAULT (compute storage action)
-        vault_match = self.VAULT_PATTERN.search(text)
-        if vault_match:
-            try:
-                offer_e = int(vault_match.group(1))
-                request_c = int(vault_match.group(2))
-                
-                errors = self._validate_vault(offer_e, request_c, agent_id)
-                
-                action = NexusRlAction(
-                    action_type="VAULT",
-                    offer_E=offer_e,
-                    request_C=request_c,
-                    validation_errors=errors if errors else []
-                )
-                
-                confidence = 0.95 if not errors else 0.7
-                parse_error = "; ".join(errors) if errors else None
-                
-                return ParseResult(
-                    action=action,
-                    confidence=confidence,
-                    parse_error=parse_error,
-                    raw_text=text
-                )
-            except (ValueError, IndexError) as e:
-                self.logger.warning(f"VAULT parse error: {e}")
-        
-        # Try WAIT
-        wait_match = self.WAIT_PATTERN.search(text)
-        if wait_match:
-            action = NexusRlAction(action_type="WAIT")
+
+        text_upper = text.upper()
+
+        # Choose the last mentioned command to capture final intent in CoT text.
+        candidates = []
+        for cmd in self.COMMANDS:
+            for match in re.finditer(rf'\b{cmd}\b', text_upper):
+                candidates.append((match.start(), cmd))
+
+        found_cmd = None
+        cmd_idx = -1
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            cmd_idx, found_cmd = candidates[-1]
+
+        if not found_cmd:
+            self.logger.warning(f"No valid action found in: {text[:100]}...")
             return ParseResult(
-                action=action,
-                confidence=0.95,
+                action=NexusRlAction(action_type="WAIT"),
+                confidence=0.0,
+                parse_error="❌ PARSE ERROR: No valid action keyword detected. Expected: PROPOSE, ACCEPT, REJECT, WORK, VAULT, or WAIT",
+                raw_text=text
+            )
+
+        if found_cmd == "WAIT":
+            return ParseResult(
+                action=NexusRlAction(action_type="WAIT"),
+                confidence=1.0,
                 parse_error=None,
                 raw_text=text
             )
-        
-        # No valid command found → default to WAIT with error
-        self.logger.warning(f"No valid action found in: {text[:100]}...")
+
+        # Extract all numeric values after the command; ignores units and punctuation.
+        search_space = text[cmd_idx + len(found_cmd):]
+        numbers = re.findall(r"[-+]?\d*\.\d+|\d+", search_space)
+
+        try:
+            if found_cmd == "PROPOSE":
+                if len(numbers) < 3:
+                    return ParseResult(
+                        action=NexusRlAction(action_type="WAIT"),
+                        confidence=0.0,
+                        parse_error="❌ PARSE ERROR: PROPOSE requires 3 numbers: target_id offer_E request_C",
+                        raw_text=text
+                    )
+
+                target_id = int(float(numbers[0]))
+                offer_e = int(float(numbers[1]))
+                request_c = int(float(numbers[2]))
+                errors = self._validate_propose(target_id, offer_e, request_c, agent_id)
+
+                return ParseResult(
+                    action=NexusRlAction(
+                        action_type="PROPOSE",
+                        target_id=target_id,
+                        offer_E=offer_e,
+                        request_C=request_c,
+                        validation_errors=errors if errors else []
+                    ),
+                    confidence=1.0 if not errors else 0.7,
+                    parse_error=("; ".join(errors) if errors else None),
+                    raw_text=text
+                )
+
+            if found_cmd in ["ACCEPT", "REJECT"]:
+                if len(numbers) < 1:
+                    return ParseResult(
+                        action=NexusRlAction(action_type="WAIT"),
+                        confidence=0.0,
+                        parse_error=f"❌ PARSE ERROR: {found_cmd} requires 1 number: target_id",
+                        raw_text=text
+                    )
+
+                target_id = int(float(numbers[0]))
+                errors = self._validate_target_id(target_id, agent_id)
+
+                return ParseResult(
+                    action=NexusRlAction(
+                        action_type=found_cmd,
+                        target_id=target_id,
+                        validation_errors=errors if errors else []
+                    ),
+                    confidence=1.0 if not errors else 0.7,
+                    parse_error=("; ".join(errors) if errors else None),
+                    raw_text=text
+                )
+
+            if found_cmd in ["WORK", "VAULT"]:
+                if len(numbers) < 2:
+                    return ParseResult(
+                        action=NexusRlAction(action_type="WAIT"),
+                        confidence=0.0,
+                        parse_error=f"❌ PARSE ERROR: {found_cmd} requires 2 numbers: offer_E request_C",
+                        raw_text=text
+                    )
+
+                offer_e = int(float(numbers[0]))
+                request_c = int(float(numbers[1]))
+                errors = self._validate_work(offer_e, request_c, agent_id) if found_cmd == "WORK" else self._validate_vault(offer_e, request_c, agent_id)
+
+                return ParseResult(
+                    action=NexusRlAction(
+                        action_type=found_cmd,
+                        offer_E=offer_e,
+                        request_C=request_c,
+                        validation_errors=errors if errors else []
+                    ),
+                    confidence=1.0 if not errors else 0.7,
+                    parse_error=("; ".join(errors) if errors else None),
+                    raw_text=text
+                )
+
+        except Exception as e:
+            self.logger.warning(f"{found_cmd} parse error: {e}")
+            return ParseResult(
+                action=NexusRlAction(action_type="WAIT"),
+                confidence=0.0,
+                parse_error=f"❌ PARSE ERROR: Internal parse failure: {str(e)}",
+                raw_text=text
+            )
+
+        # Should not be reachable, but keep a safe fallback.
         return ParseResult(
             action=NexusRlAction(action_type="WAIT"),
             confidence=0.0,
-            parse_error="❌ PARSE ERROR: No valid action detected. Expected: PROPOSE, ACCEPT, REJECT, or WAIT",
+            parse_error="❌ PARSE ERROR: Unhandled command mapping",
             raw_text=text
         )
-    
+
     def _validate_propose(
         self, target_id: int, offer_e: int, request_c: int, agent_id: int
     ) -> List[str]:
