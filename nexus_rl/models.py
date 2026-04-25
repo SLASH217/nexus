@@ -198,3 +198,7 @@ class NexusRlObservation(Observation):
         default=0.0,
         description="Leontief utility: min(E, C) for this agent"
     )
+    
+    class Config:
+        """Allow extra fields to be assigned (for metadata from environment)."""
+        extra = "allow"

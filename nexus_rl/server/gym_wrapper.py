@@ -26,6 +26,7 @@ from gymnasium import spaces
 # Absolute imports for Colab compatibility
 from nexus_rl.server.nexus_rl_environment import NexusRlEnvironment, ENVConfig
 from nexus_rl.server.formatting import format_observation_for_llm
+from nexus_rl.server.logic import calculate_utility
 from nexus_rl.models import NexusRlAction, NexusRlObservation
 
 logger = logging.getLogger(__name__)
@@ -480,10 +481,24 @@ class NexusGymWrapper(gym.Env):
             num_agents=self.config.num_agents
         )
         
+        # Extract utility from observation for evaluator compatibility
+        utility = getattr(obs, 'utility', 0.0)
+        if utility is None:
+            utility = 0.0
+        
+        # Extract metadata for evaluator compatibility
+        obs_metadata = getattr(obs, 'metadata', {})
+        if obs_metadata is None:
+            obs_metadata = {}
+        
         info = {
             "step": 0,
             "episode_id": self.env._state.episode_id,
             "agent_id": self.agent_id,
+            # Add observation metadata for evaluator
+            "utility": utility,
+            "metadata": obs_metadata,
+            "obs_object": obs,  # Keep reference to full observation for advanced usage
         }
         
         return obs_text, info
@@ -518,46 +533,84 @@ class NexusGymWrapper(gym.Env):
         self.last_parse_error = parse_result.parse_error
         self.last_validation_errors = action.validation_errors or []
         
+        # Initialize reward
+        reward = 0.0
+        terminated = False
+        raw_obs = None
+        
         # If parse failed, return penalty and continue
         if parse_result.parse_error and parse_result.confidence < 0.5:
             reward = self.invalid_action_penalty
             self.logger.warning(f"Parse error (penalty): {parse_result.parse_error}")
+            # Still need to get an observation for next step
+            obs = self._get_current_obs()
         else:
-            # Execute action
-            raw_obs = self.env.step(action)
-            
-            # 1. Use the pre-calculated delta_utility from the environment metadata
-            # Our environment already calculates this using Total Resources (Avail + Locked)
-            reward = raw_obs.metadata.get("delta_utility", 0.0)
-            
-            # 2. Add System Welfare (The Social Welfare component)
-            # R = ΔU_self + λ * Σ(ΔU_others)
-            reward_breakdown = raw_obs.metadata.get("reward_breakdown", {})
-            total_reward = reward_breakdown.get("total", reward)
-            
-            # 3. Apply formatting penalty
-            if self.last_validation_errors or self.last_parse_error:
-                total_reward += self.invalid_action_penalty  # -1.0
-                self.logger.warning(f"Validation errors: {self.last_validation_errors}")
-            
-            reward = total_reward
+            try:
+                # Execute action in environment
+                raw_obs = self.env.step(action)
+                
+                # Extract reward from environment observation (safely)
+                reward = getattr(raw_obs, 'reward', 0.0)
+                if reward is None:
+                    reward = 0.0
+                
+                # Check if environment has metadata for more detailed reward
+                metadata = getattr(raw_obs, 'metadata', {})
+                if isinstance(metadata, dict):
+                    # Use detailed reward breakdown if available
+                    reward_breakdown = metadata.get("reward_breakdown", {})
+                    if reward_breakdown and "total" in reward_breakdown:
+                        reward = reward_breakdown["total"]
+                
+                # Apply formatting penalty for validation errors
+                if self.last_validation_errors or self.last_parse_error:
+                    reward += self.invalid_action_penalty  # -1.0
+                    self.logger.warning(f"Validation errors: {self.last_validation_errors}")
+                
+                # Check termination from environment
+                terminated = getattr(raw_obs, 'done', False)
+                if terminated is None:
+                    terminated = False
+                
+                # Use the returned observation directly
+                obs = raw_obs
+                
+            except Exception as e:
+                self.logger.error(f"Error executing action: {e}")
+                reward = self.invalid_action_penalty
+                obs = self._get_current_obs()
         
-        # Get next observation
-        obs = self.env._current_obs if hasattr(self.env, '_current_obs') else self._get_current_obs()
+        # Format observation as text
         obs_text = self._format_obs_with_errors(obs)
         
-        # Check termination
-        step_count = self.env._state.step_count
-        terminated = step_count >= self.config.MAX_EPISODE_STEPS
+        # Check step count for truncation
+        step_count = self.env._state.step_count if hasattr(self.env, '_state') else 0
         truncated = False
+        if not terminated and step_count >= self.config.MAX_EPISODE_STEPS:
+            terminated = True
+            truncated = True
+        
+        # Extract utility from observation for evaluator compatibility
+        utility = getattr(obs, 'utility', 0.0)
+        if utility is None:
+            utility = 0.0
+        
+        # Extract metadata for evaluator compatibility
+        obs_metadata = getattr(obs, 'metadata', {})
+        if obs_metadata is None:
+            obs_metadata = {}
         
         info = {
             "step": step_count,
-            "episode_id": self.env._state.episode_id,
+            "episode_id": getattr(self.env._state, 'episode_id', 0) if hasattr(self.env, '_state') else 0,
             "agent_id": self.agent_id,
             "parse_confidence": parse_result.confidence,
             "parse_error": parse_result.parse_error,
             "validation_errors": self.last_validation_errors,
+            # Add observation metadata for evaluator
+            "utility": utility,
+            "metadata": obs_metadata,
+            "obs_object": obs,  # Keep reference to full observation for advanced usage
         }
         
         return obs_text, reward, terminated, truncated, info
@@ -580,20 +633,50 @@ class NexusGymWrapper(gym.Env):
             'C_locked': self.env.agents[self.agent_id].get('C_locked', 0),
         }
         
-        utility = self.env._calculate_agent_utility(self.agent_id)
+        # Use calculate_utility function from logic.py with dual-key inventory
+        utility = calculate_utility(inventory=inventory)
+        
+        # Get trust scores for all other agents (social_lattice)
+        social_lattice = {}
+        if hasattr(self.env, 'trust_scores') and self.agent_id in self.env.trust_scores:
+            social_lattice = self.env.trust_scores[self.agent_id].copy()
+        
+        # Get incoming proposals for this agent
+        incoming_proposals = []
+        if hasattr(self.env, 'active_proposals'):
+            for proposal_key, proposal_data in self.env.active_proposals.items():
+                if proposal_data.get('target_id') == self.agent_id:
+                    incoming_proposals.append({
+                        "proposer_id": proposal_data.get('proposer_id'),
+                        "offer_E": proposal_data.get('offer_E', 0),
+                        "request_C": proposal_data.get('request_C', 0),
+                        "created_step": proposal_data.get('created_step', self.env._state.step_count)
+                    })
+        
+        # Calculate reputation as average of what others think of this agent
+        reputation_score = 0.5
+        if hasattr(self.env, 'trust_scores'):
+            scores = []
+            for agent_id, trust_dict in self.env.trust_scores.items():
+                if agent_id != self.agent_id and self.agent_id in trust_dict:
+                    scores.append(trust_dict[self.agent_id])
+            if scores:
+                reputation_score = sum(scores) / len(scores)
+        
+        # Get current environment shock status
+        environment_status = "NORMAL"
+        if hasattr(self.env, 'current_shock') and self.env.current_shock:
+            environment_status = self.env.current_shock
         
         return NexusRlObservation(
             agent_id=self.agent_id,
             inventory=inventory,
-            trust_scores=self.env.trust_scores.get(self.agent_id, {}),
+            social_lattice=social_lattice,
             public_ledger=self.env.public_ledger,
+            incoming_proposals=incoming_proposals,
+            reputation_score=reputation_score,
             utility=utility,
-            environment_status=self.env.current_shock,
-            metadata={
-                "step": self.env._state.step_count,
-                "delta_utility": 0.0,
-                "validation_errors": [],
-            }
+            environment_status=environment_status
         )
     
     def _format_obs_with_errors(self, obs: NexusRlObservation) -> str:
