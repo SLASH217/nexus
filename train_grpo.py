@@ -51,6 +51,7 @@ except ImportError:
 # Nexus environment
 try:
     from nexus_rl.server import create_nexus_env, ENVConfig
+    from nexus_rl.server.nexus_rl_environment import AgentArchetype
     from nexus_rl.models import NexusRlAction
 except ImportError:
     print("❌ Error: Nexus environment not found. Check PYTHONPATH.")
@@ -105,7 +106,18 @@ class TrainingConfig:
     def __post_init__(self):
         """Validate configuration."""
         if self.env_config is None:
-            self.env_config = ENVConfig(num_agents=4)
+            # Initialize with proper agent distribution and archetypes
+            # Agent 0 is always LEARNER (the trainable agent)
+            # Others are NPC heuristics to provide learning signal
+            self.env_config = ENVConfig(
+                num_agents=4,
+                agent_distribution={
+                    AgentArchetype.LEARNER: 1,      # Agent 0: The one we're training
+                    AgentArchetype.BULLY: 1,        # Agent 1: Greedy (high E, low C)
+                    AgentArchetype.ALTRUIST: 1,     # Agent 2: Generous (low E, high C)
+                    AgentArchetype.TIT_FOR_TAT: 1,  # Agent 3: Reciprocal (balanced)
+                }
+            )
         
         if not HAS_TRL and self.num_episodes > 0:
             logger.warning("TRL not available; running validation mode only")

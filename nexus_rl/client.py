@@ -57,6 +57,9 @@ class NexusRlEnv(
         Convert NexusRlAction to JSON payload for step message.
 
         Maps the rich action structure to the JSON payload the server expects.
+        
+        SECURITY: "message" field removed to prevent Cheap Talk exploits.
+        Use SIGNAL actions with verifiable commitments instead.
 
         Args:
             action: NexusRlAction instance
@@ -69,7 +72,8 @@ class NexusRlEnv(
             "target_id": action.target_id,
             "offer_E": action.offer_E,
             "request_C": action.request_C,
-            "message": action.message,
+            "signal_offer_E": action.signal_offer_E,
+            "signal_request_C": action.signal_request_C,
         }
 
     def _parse_result(self, payload: Dict) -> StepResult[NexusRlObservation]:
@@ -78,6 +82,9 @@ class NexusRlEnv(
 
         Converts the server's raw JSON response back into our rich Pydantic Observation,
         properly unwrapping the OpenEnv envelope format.
+        
+        Handles dual-key inventory system (E_available/E_locked, C_available/C_locked)
+        and new observation fields like incoming_proposals and reputation_score.
 
         Args:
             payload: JSON response data from server
@@ -86,13 +93,34 @@ class NexusRlEnv(
             StepResult with NexusRlObservation
         """
         obs_data = payload.get("observation", {})
+        
+        # Handle dual-key inventory system (new format) with fallback to legacy
+        inventory_raw = obs_data.get("inventory", {})
+        if "E_available" in inventory_raw or "C_available" in inventory_raw:
+            # New dual-key format
+            inventory = {
+                "E_available": inventory_raw.get("E_available", 0),
+                "E_locked": inventory_raw.get("E_locked", 0),
+                "C_available": inventory_raw.get("C_available", 0),
+                "C_locked": inventory_raw.get("C_locked", 0),
+            }
+        else:
+            # Legacy fallback (for backward compatibility)
+            inventory = {
+                "E_available": inventory_raw.get("E", 0),
+                "E_locked": 0,
+                "C_available": inventory_raw.get("C", 0),
+                "C_locked": 0,
+            }
 
         # Build the observation Agent 0 will actually see
         observation = NexusRlObservation(
             agent_id=obs_data.get("agent_id", 0),
-            inventory=obs_data.get("inventory", {"E": 0, "C": 0}),
+            inventory=inventory,
             public_ledger=obs_data.get("public_ledger", []),
             social_lattice=obs_data.get("social_lattice", {}),
+            incoming_proposals=obs_data.get("incoming_proposals", []),
+            reputation_score=obs_data.get("reputation_score", 0.5),
             environment_status=obs_data.get("environment_status", "NORMAL"),
             utility=obs_data.get("utility", 0.0),
             done=payload.get("done", False),

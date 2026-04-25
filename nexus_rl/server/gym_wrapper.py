@@ -74,6 +74,14 @@ class NexusActionParser:
         r'\bREJECT\s+(\d+)\b',
         re.IGNORECASE
     )
+    WORK_PATTERN = re.compile(
+        r'\bWORK\s+(\d+)\s+(\d+)\b',
+        re.IGNORECASE
+    )
+    VAULT_PATTERN = re.compile(
+        r'\bVAULT\s+(\d+)\s+(\d+)\b',
+        re.IGNORECASE
+    )
     WAIT_PATTERN = re.compile(
         r'\bWAIT\b',
         re.IGNORECASE
@@ -199,6 +207,62 @@ class NexusActionParser:
             except (ValueError, IndexError) as e:
                 self.logger.warning(f"REJECT parse error: {e}")
         
+        # Try WORK (energy production action)
+        work_match = self.WORK_PATTERN.search(text)
+        if work_match:
+            try:
+                offer_e = int(work_match.group(1))
+                request_c = int(work_match.group(2))
+                
+                errors = self._validate_work(offer_e, request_c, agent_id)
+                
+                action = NexusRlAction(
+                    action_type="WORK",
+                    offer_E=offer_e,
+                    request_C=request_c,
+                    validation_errors=errors if errors else []
+                )
+                
+                confidence = 0.95 if not errors else 0.7
+                parse_error = "; ".join(errors) if errors else None
+                
+                return ParseResult(
+                    action=action,
+                    confidence=confidence,
+                    parse_error=parse_error,
+                    raw_text=text
+                )
+            except (ValueError, IndexError) as e:
+                self.logger.warning(f"WORK parse error: {e}")
+        
+        # Try VAULT (compute storage action)
+        vault_match = self.VAULT_PATTERN.search(text)
+        if vault_match:
+            try:
+                offer_e = int(vault_match.group(1))
+                request_c = int(vault_match.group(2))
+                
+                errors = self._validate_vault(offer_e, request_c, agent_id)
+                
+                action = NexusRlAction(
+                    action_type="VAULT",
+                    offer_E=offer_e,
+                    request_C=request_c,
+                    validation_errors=errors if errors else []
+                )
+                
+                confidence = 0.95 if not errors else 0.7
+                parse_error = "; ".join(errors) if errors else None
+                
+                return ParseResult(
+                    action=action,
+                    confidence=confidence,
+                    parse_error=parse_error,
+                    raw_text=text
+                )
+            except (ValueError, IndexError) as e:
+                self.logger.warning(f"VAULT parse error: {e}")
+        
         # Try WAIT
         wait_match = self.WAIT_PATTERN.search(text)
         if wait_match:
@@ -260,6 +324,52 @@ class NexusActionParser:
             errors.append(f"Cannot interact with yourself (agent {agent_id})")
         if target_id < 0:
             errors.append(f"Invalid target ID: {target_id} (must be >= 0)")
+        
+        return errors
+    
+    def _validate_work(self, offer_e: int, request_c: int, agent_id: int) -> List[str]:
+        """
+        Validate WORK (energy production) action parameters.
+        
+        WORK represents the agent using available resources to generate more.
+        This requires having minimum resources to start with.
+        
+        Returns:
+            List of error messages (empty if valid)
+        """
+        errors = []
+        
+        # Resource validation
+        if offer_e < 0 or offer_e > self.max_resource:
+            errors.append(f"Invalid energy offer in WORK: {offer_e} (must be 0-{self.max_resource})")
+        if request_c < 0 or request_c > self.max_resource:
+            errors.append(f"Invalid compute request in WORK: {request_c} (must be 0-{self.max_resource})")
+        
+        if offer_e == 0 and request_c == 0:
+            errors.append("Cannot WORK with zero energy and zero compute")
+        
+        return errors
+    
+    def _validate_vault(self, offer_e: int, request_c: int, agent_id: int) -> List[str]:
+        """
+        Validate VAULT (compute storage) action parameters.
+        
+        VAULT represents the agent locking resources in secure storage for future use.
+        This requires having minimum resources to vault.
+        
+        Returns:
+            List of error messages (empty if valid)
+        """
+        errors = []
+        
+        # Resource validation
+        if offer_e < 0 or offer_e > self.max_resource:
+            errors.append(f"Invalid energy in VAULT: {offer_e} (must be 0-{self.max_resource})")
+        if request_c < 0 or request_c > self.max_resource:
+            errors.append(f"Invalid compute in VAULT: {request_c} (must be 0-{self.max_resource})")
+        
+        if offer_e == 0 and request_c == 0:
+            errors.append("Cannot VAULT zero energy and zero compute")
         
         return errors
 

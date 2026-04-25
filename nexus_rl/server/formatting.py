@@ -343,6 +343,25 @@ def format_observation_for_llm(
         lines.append(f"  Agent {agent_id} ({name}): {bar}")
     lines.append("")
     
+    # Incoming proposals (active proposals targeting YOU)
+    if obs.incoming_proposals:
+        lines.append("PENDING PROPOSALS (Awaiting Your Response):")
+        for proposal in obs.incoming_proposals[:10]:  # Show last 10
+            proposer_id = proposal.get("proposer_id", "?")
+            offer_e = proposal.get("offer_E", 0)
+            request_c = proposal.get("request_C", 0)
+            lines.append(f"  • Agent {proposer_id} proposes: {offer_e}E → you give {request_c}C")
+            lines.append(f"    (Use ACCEPT {proposer_id} or REJECT {proposer_id})")
+        lines.append("")
+    
+    # Reputation score (The Mirror)
+    lines.append("THE MIRROR (How Others View You):")
+    lines.append(f"  Your Average Trust Score from Others: {obs.reputation_score:.2f}")
+    lines.append(f"  • 0.0-0.3: You're distrusted (Pariah)")
+    lines.append(f"  • 0.3-0.7: Neutral reputation")
+    lines.append(f"  • 0.7-1.0: You're trusted (Ally)")
+    lines.append("")
+    
     # Recent trades (keep last N raw for tactical context)
     lines.append("RECENT TRADES (Last 5):")
     lines.append(format_recent_trades(obs.public_ledger, max_entries=5))
@@ -386,7 +405,11 @@ def format_observation_for_llm(
     lines.append("     → Accept a pending proposal")
     lines.append("  3. REJECT <target_id>")
     lines.append("     → Decline a proposal")
-    lines.append("  4. WAIT")
+    lines.append("  4. WORK <energy_invested> <compute_generated>")
+    lines.append("     → Use resources to produce more value")
+    lines.append("  5. VAULT <energy_to_lock> <compute_to_lock>")
+    lines.append("     → Lock resources in secure storage for future use")
+    lines.append("  6. WAIT")
     lines.append("     → Do nothing this turn (no reward)")
     lines.append("")
     
