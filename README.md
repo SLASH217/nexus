@@ -331,7 +331,7 @@ This is critical for:
 🟡 After SFT Plot
 ![App Screenshot](./images/img2.png)
 
-🟢 After GRPO Plot
+🟢 After GRPO Plot (extrapolated from data of limited episodes)
 ![App Screenshot](./images/Code_Generated_Image.png)
 
 ---
