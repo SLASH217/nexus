@@ -40,7 +40,13 @@ from datasets import Dataset
 
 # HF Ecosystem
 from transformers import AutoTokenizer, TextIteratorStreamer
-from unsloth import FastLanguageModel, unsloth_fix_chat_templates, is_bf16_supported
+from unsloth import FastLanguageModel
+
+try:
+    from unsloth import is_bf16_supported
+except ImportError:
+    def is_bf16_supported() -> bool:
+        return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
 # TRL (if available, fallback to warnings)
 try:
@@ -77,7 +83,7 @@ class TrainingConfig:
     """Training hyperparameters."""
     
     # Model
-    model_name: str = "meta-llama/Llama-2-7b"  # Or meta-llama/Llama-2-13b
+    model_name: str = "SLASH217/llama-8b-sft-warm"  # Hub-hosted SFT checkpoint
     load_in_4bit: bool = True  # Use 4-bit quantization via Unsloth
     max_seq_length: int = 2048  # For LoRA
     
@@ -98,6 +104,7 @@ class TrainingConfig:
     env_config: ENVConfig = None  # Use default (4-agent cohort)
     invalid_action_penalty: float = -1.0
     use_llm_npcs: bool = True  # Toggle for dynamic LLM-based NPCs
+    llm_model_id: str = "unsloth/llama-3-8b-instruct-bnb-4bit"  # Model for dynamic NPC controller
     llm_batch_size: int = 4  # Batch size for LLM NPC inference
     llm_temperature: float = 0.7  # Temperature for LLM NPC sampling
     
@@ -118,6 +125,7 @@ class TrainingConfig:
             self.env_config = ENVConfig(
                 num_agents=4,
                 use_llm_npcs=self.use_llm_npcs,
+                llm_model_id=self.llm_model_id,
                 llm_batch_size=self.llm_batch_size,
                 llm_temperature=self.llm_temperature,
                 agent_distribution={
@@ -503,8 +511,14 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="meta-llama/Llama-2-7b",
-        help="HF model name (requires HF token for Llama access)",
+        default="SLASH217/llama-8b-sft-warm",
+        help="HF model repo for the warmed SFT checkpoint",
+    )
+    parser.add_argument(
+        "--hub_model_id",
+        type=str,
+        default="SLASH217/llama-8b-grpo",
+        help="HF Hub repo to push the GRPO result to",
     )
     parser.add_argument(
         "--output_dir",

@@ -50,7 +50,7 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import NexusRlAction, NexusRlObservation
     from .nexus_rl_environment import NexusRlEnvironment
-except ModuleNotFoundError:
+except (ImportError, ModuleNotFoundError):
     from models import NexusRlAction, NexusRlObservation
     from server.nexus_rl_environment import NexusRlEnvironment
 

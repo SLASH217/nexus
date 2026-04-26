@@ -1,0 +1,28 @@
+-e .
+
+# Core HF / training stack
+accelerate>=1.13.0
+bitsandbytes
+datasets>=4.4.1
+huggingface-hub>=1.11.0
+peft>=0.18.0
+transformers>=5.5.4
+trl>=1.2.0
+unsloth
+
+# Nexus environment dependencies
+gymnasium>=1.2.3
+openenv-core>=0.2.3
+pydantic>=2.13.3
+python-dotenv>=1.2.2
+
+# Observability / analysis
+matplotlib>=3.10.8
+numpy>=2.4.4
+pandas>=3.0.2
+seaborn>=0.13.2
+tabulate>=0.10.0
+wandb>=0.22.0
+
+# Optional but commonly needed when running cloud jobs locally as well
+torch>=2.10.0

@@ -41,8 +41,8 @@ try:
     from .formatting import format_observation_for_llm
 except ImportError:
     from models import NexusRlAction, NexusRlObservation
-    from logic import calculate_utility, update_trust, apply_trust_decay, calculate_shock
-    from formatting import format_observation_for_llm
+    from server.logic import calculate_utility, update_trust, apply_trust_decay, calculate_shock
+    from server.formatting import format_observation_for_llm
 
 # Configure logging for debugging agent interactions
 logger = logging.getLogger(__name__)
@@ -342,7 +342,7 @@ class ENVConfig:
     use_llm_npcs: bool = False  # False=static heuristics, True=LLM agents
     
     # LLM Model Configuration
-    llm_model_id: str = "unsloth/llama-3-8b-4bit"  # HuggingFace model ID (4-bit quantized)
+    llm_model_id: str = "unsloth/llama-3-8b-instruct-bnb-4bit"  # HuggingFace model ID (4-bit quantized)
     llm_batch_size: int = 4  # Process N agents in parallel (reduce if OOM)
     llm_temperature: float = 0.7  # Sampling temperature (0.0-1.0, higher=more diverse)
     llm_max_tokens: int = 150  # Max tokens per action generation
@@ -412,6 +412,7 @@ class NexusRlEnvironment(Environment):
         
         # Pending proposals buffer for async trade settlement
         self.active_proposals: Dict[str, Dict] = {}
+        self._last_step_reward: float = 0.0
         
         # FIX: Sync initial utility tracking with the new dual-key system
         self.previous_utilities: Dict[int, float] = {}
@@ -597,6 +598,14 @@ class NexusRlEnvironment(Environment):
             agent.get("E_available", 0),
             agent.get("C_available", 0)
         )
+
+    def _serialize_agent_inventory(self, inventory: Dict) -> Dict:
+        """Return a JSON-safe copy of agent inventory for API responses."""
+        safe = dict(inventory)
+        archetype = safe.get("archetype")
+        if isinstance(archetype, Enum):
+            safe["archetype"] = archetype.value
+        return safe
     
     def _lock_resources(self, agent_id: int, energy: int, compute: int) -> bool:
         """
@@ -684,7 +693,7 @@ class NexusRlEnvironment(Environment):
         agent_id = 0
         return NexusRlObservation(
             agent_id=agent_id,
-            inventory=self.agents[agent_id].copy(),
+            inventory=self._serialize_agent_inventory(self.agents[agent_id]),
             public_ledger=self.public_ledger.copy(),
             social_lattice=self.trust_scores[agent_id].copy(),
             environment_status=self.current_shock,
@@ -999,6 +1008,7 @@ class NexusRlEnvironment(Environment):
         validation_penalty = -1.0 * len(validation_errors) if validation_errors else 0.0
         
         reward = agent_0_reward_component + system_welfare_component + collateral_component + validation_penalty
+        self._last_step_reward = reward
         
         # Calculate trust metrics for observation (instrumental, not terminal)
         trust_in_me = [
@@ -1052,7 +1062,7 @@ class NexusRlEnvironment(Environment):
 
         obs = NexusRlObservation(
             agent_id=agent_0_id,
-            inventory=self.agents[agent_0_id],
+            inventory=self._serialize_agent_inventory(self.agents[agent_0_id]),
             public_ledger=self.public_ledger[-self.config.LEDGER_HISTORY_SIZE:],  # Last N transactions
             incoming_proposals=incoming,
             social_lattice=self.trust_scores[agent_0_id],
@@ -1247,7 +1257,7 @@ class NexusRlEnvironment(Environment):
         
         return NexusRlObservation(
             agent_id=npc_id,
-            inventory=self.agents[npc_id],
+            inventory=self._serialize_agent_inventory(self.agents[npc_id]),
             public_ledger=self.public_ledger[-self.config.llm_ledger_history_limit:],
             incoming_proposals=incoming,
             social_lattice=self.trust_scores[npc_id],
@@ -1540,7 +1550,10 @@ class NexusRlEnvironment(Environment):
         # Attach the full ground truth to the state object for serialization
         # This ensures the API /state endpoint returns individual attributes
         self._state.metadata = {
-            "agents": self.agents,
+            "agents": {
+                agent_id: self._serialize_agent_inventory(agent_inventory)
+                for agent_id, agent_inventory in self.agents.items()
+            },
             "trust_scores": self.trust_scores,
             "reputation_scores": reputation_scores,
             "active_proposals": {
@@ -1556,7 +1569,7 @@ class NexusRlEnvironment(Environment):
             "previous_utilities": self.previous_utilities,
             "reset_count": self._reset_count,
             "step_count": self._state.step_count,
-            "last_step_reward": reward
+            "last_step_reward": self._last_step_reward
         }
         return self._state
 
