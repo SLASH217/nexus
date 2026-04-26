@@ -389,8 +389,9 @@ This is directly relevant to cloud systems, edge networks, and multi-agent AI �
 
 ## 🔗 Colab (Training)
 
-👉 Colab link - 
-👉 Colab link - 
+👉 Colab link (Baseline and SFT)  - https://colab.research.google.com/drive1ZEelRsQJlGoYo70iD0uEFAk0suWuufyN?usp=sharing
+
+👉 Colab link (GRPO) - 
 
 ---
 
@@ -400,7 +401,7 @@ This is directly relevant to cloud systems, edge networks, and multi-agent AI �
 
 👉 HF Enviorment Link - https://huggingface.co/spaces/SLASH217/nexus_rl
 
-👉 HF Blog Link -
+👉 HF Blog Link - https://huggingface.co/spaces/SLASH217/nexus_rl/blob/main/Blog.md
 
 ---
 
