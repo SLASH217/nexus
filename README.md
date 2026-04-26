@@ -309,8 +309,8 @@ This is critical for:
 
 | Metric       | Before  | After   |
 | ------------ | ------- | ------- |
-| Avg Reward   | ~14–16  | ~20–25+ |
-| Parse Errors | ~10–15% | ~3–8%   |
+| Avg Reward   | ~18–28  | ~34–40+ |
+| Parse Errors | ~34–40% | ~2–4%   |
 | Coordination | Low     | High    |
 
 **Observed behaviors:**
