@@ -183,18 +183,7 @@ Where:
 
 ## 🏗️ Architecture
 
-```mermaid
-
-flowchart TD
-    A[LLM Agent] --> B[Action Parser]
-    B --> C[Gym Wrapper]
-    C --> D[Nexus Environment]
-    D --> E[Trade / Trust Update]
-    E --> F[Reward (ΔUtility)]
-    F --> G[Observation Builder]
-    G --> A
-
-````
+![App Screenshot](./images/img4.png)
 
 -------
 
@@ -401,13 +390,16 @@ This is directly relevant to cloud systems, edge networks, and multi-agent AI �
 ## 🔗 Colab (Training)
 
 👉 Colab link - 
+👉 Colab link - 
 
 ---
 
 ## 🤗 HuggingFace / Blog
 
 👉 HF Model Link - https://huggingface.co/SLASH217/llama-8b-sft-warm/tree/main
+
 👉 HF Enviorment Link - https://huggingface.co/spaces/SLASH217/nexus_rl
+
 👉 HF Blog Link -
 
 ---
@@ -426,10 +418,15 @@ We train them to learn:
 ## 📚 Citation & Code
 
 Refernce paper links -
+
 [View Report](./Research/rs1.pdf)
+
 [View Report](./Research/rs2.pdf)
+
 [View Report](./Research/rs3.pdf)
+
 [View Report](./Research/ps4.pdf)
+
 [View Report](./Research/rs5.pdf)
 
 
