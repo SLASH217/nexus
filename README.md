@@ -137,7 +137,7 @@ SIGNAL target_id signal_offer_E signal_request_C
 
 The reward signal balances *utility maximization* with *long-term trust building:*
 
-$$R_t = w_1 \cdot \Delta U_t + w_2 \cdot \Delta \text{Collateral}_t + w_3 \cdot \text{Shock\_Resilience}_t$$
+$$R\_t = w\_1 \cdot \Delta U\_t + w\_2 \cdot \Delta \text{Collateral}\_t + w\_3 \cdot \text{Shock\_Resilience}\_t$$
 
 Where:
 
