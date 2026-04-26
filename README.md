@@ -391,7 +391,7 @@ This is directly relevant to cloud systems, edge networks, and multi-agent AI �
 
 👉 Colab link (Baseline and SFT)  - https://colab.research.google.com/drive/1ZEelRsQJlGoYo70iD0uEFAk0suWuufyN?usp=sharing
 
-👉 Colab link (GRPO) - 
+👉 Colab link (GRPO) - https://colab.research.google.com/drive/19T5uVZMjgnjwkmx-ItoIHPmOQzuZSlT3?authuser=3#scrollTo=vX4feQ3o68kN
 
 ---
 
