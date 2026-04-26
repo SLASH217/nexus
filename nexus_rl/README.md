@@ -1,3 +1,12 @@
+---
+title: nexus_rl
+emoji: "🧠"
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
 # 🧠 Protocol: Nexus  
 
 ### Learning Strategic Cooperation Under Scarcity
@@ -161,7 +170,7 @@ Where:
 
 ---
 
-## ⚡ Key Incentive Structures (In Plain English)
+## ⚡ Key Incentive Structures
 
 1. *Cooperation Profit:* Good trades increase trust, which unlocks higher-value opportunities later
 2. *Betrayal Cost:* Breaking promises damages long-term access to resources (reputation penalty)
@@ -291,8 +300,8 @@ This is critical for:
 
 ### 🔴 Baseline (Untrained / Static)
 
-* Parse error: ~40–50%
-* Utility: ~8–15
+* Parse error: ~30–50%
+* Utility: ~12–41
 * Behavior: random / unstable
 
 ---
@@ -302,6 +311,7 @@ This is critical for:
 * Parse errors near zero
 * Stable execution
 * Still **no strategic depth**
+* Still not optimizing utility, staying happy with average gains.
 
 ---
 
@@ -310,7 +320,7 @@ This is critical for:
 | Metric       | Before  | After   |
 | ------------ | ------- | ------- |
 | Avg Reward   | ~14–16  | ~20–25+ |
-| Parse Errors | ~10–15% | ~3–8%   |
+| Parse Errors | ~10–15% | ~3–5%   |
 | Coordination | Low     | High    |
 
 **Observed behaviors:**
@@ -370,10 +380,13 @@ This is directly relevant to cloud systems, edge networks, and multi-agent AI �
 
 ## 🔮 Future Scope
 
-* Fully LLM-driven agents (no heuristics)
-* Scaling to 8–12+ agents (population dynamics)
-* Stronger trust modeling (graph-based memory)
-* Real-world deployment simulations
+* Fully LLM-driven agents with no heuristic fallback
+* Scaling from the current cohort into many-agent Nexus populations where agents interact in a dense web of negotiations, proposals, acceptances, and trades
+* Stronger trust modeling with graph-based memory and richer reputation dynamics
+* Further strengthening agent adaptability so they can learn to survive and cooperate in a dynamic, changing world
+* Real-world deployment simulations and longer-horizon social dynamics
+
+The multi-agent scaling code is already in place, but full-scale training and validation were constrained by compute and time limits rather than missing architecture.
 
 ---
 
@@ -389,18 +402,18 @@ This is directly relevant to cloud systems, edge networks, and multi-agent AI �
 
 ## 🔗 Colab (Training)
 
-👉 Colab link - 
+👉 Colab link - https://colab.research.google.com/drive1ZEelRsQJlGoYo70iD0uEFAk0suWuufyN?usp=sharing
 👉 Colab link - 
 
 ---
 
 ## 🤗 HuggingFace / Blog
-
+  After SFT:
 👉 HF Model Link - https://huggingface.co/SLASH217/llama-8b-sft-warm/tree/main
 
 👉 HF Enviorment Link - https://huggingface.co/spaces/SLASH217/nexus_rl
 
-👉 HF Blog Link -
+👉 HF Blog Link - https://huggingface.co/spaces/SLASH217/nexus_rl/blob/main/Blog.md
 
 ---
 
