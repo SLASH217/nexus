@@ -426,10 +426,10 @@ We train them to learn:
 ## 📚 Citation & Code
 
 Refernce paper links -
-[View Report](./Research/file1.pdf)
-[View Report](./Research/file2.pdf)
-[View Report](./Research/file3.pdf)
-[View Report](./Research/file4.pdf)
-[View Report](./Research/file5.pdf)
+[View Report](./Research/rs1.pdf)
+[View Report](./Research/rs2.pdf)
+[View Report](./Research/rs3.pdf)
+[View Report](./Research/ps4.pdf)
+[View Report](./Research/rs5.pdf)
 
 
