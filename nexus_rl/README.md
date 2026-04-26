@@ -1,12 +1,15 @@
 ---
-title: nexus_rl
-emoji: "🧠"
-colorFrom: blue
-colorTo: green
+title: Nexus Rl Environment Server
+emoji: 🔉
+colorFrom: green
+colorTo: red
 sdk: docker
 pinned: false
+app_port: 8000
+base_path: /web
+tags:
+  - openenv
 ---
-
 # 🧠 Protocol: Nexus  
 
 ### Learning Strategic Cooperation Under Scarcity
