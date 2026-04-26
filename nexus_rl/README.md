@@ -414,7 +414,7 @@ The multi-agent scaling code is already in place, but full-scale training and va
   After SFT:
 👉 HF Model Link - https://huggingface.co/SLASH217/llama-8b-sft-warm/tree/main
 
-👉 HF Enviorment Link - https://huggingface.co/spaces/SLASH217/nexus_rl
+👉 HF Environment Link - https://huggingface.co/spaces/SLASH217/nexus_rl
 
 👉 HF Blog Link - https://huggingface.co/spaces/SLASH217/nexus_rl/blob/main/Blog.md
 
