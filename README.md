@@ -332,7 +332,7 @@ This is critical for:
 ![App Screenshot](./images/img2.png)
 
 🟢 After GRPO Plot
-![App Screenshot](./images/img3.png)
+![App Screenshot](./images/Code_Generated_Image.png)
 
 ---
 
