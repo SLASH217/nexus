@@ -389,7 +389,7 @@ This is directly relevant to cloud systems, edge networks, and multi-agent AI �
 
 ## 🔗 Colab (Training)
 
-👉 Colab link (Baseline and SFT)  - https://colab.research.google.com/drive1ZEelRsQJlGoYo70iD0uEFAk0suWuufyN?usp=sharing
+👉 Colab link (Baseline and SFT)  - https://colab.research.google.com/drive/1ZEelRsQJlGoYo70iD0uEFAk0suWuufyN?usp=sharing
 
 👉 Colab link (GRPO) - 
 
