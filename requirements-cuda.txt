@@ -1,5 +1,0 @@
-# For Onsite Training (NVIDIA A100/H100)
-unsloth>=2026.4.6
-vllm>=0.19.1
-bitsandbytes
-peft
